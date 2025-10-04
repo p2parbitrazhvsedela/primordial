@@ -1,21 +1,7 @@
 --[[
     Jitter Correction Resolver
-    Uses FFI and Animation Layers for accurate enemy yaw resolution
+    Advanced enemy yaw resolution using desync analysis
     Static method implementation without mode selection
-]]
-
-local ffi = require("ffi")
-
--- FFI Definitions for Animation Layers
-ffi.cdef[[
-    typedef struct {
-        float m_flCycle;
-        float m_flWeight;
-        float m_flPlaybackRate;
-        float m_flPrevCycle;
-        int m_nOrder;
-        int m_nSequence;
-    } C_AnimationLayer;
 ]]
 
 -- Configuration UI using proper menu system
@@ -40,27 +26,19 @@ for i = 1, MAX_PLAYERS do
     }
 end
 
--- Safe FFI access wrapper
-local function safe_get_animlayers(player)
+-- Get lower body yaw target
+local function get_lby(player)
     if not player then
         return nil
     end
     
     local success, result = pcall(function()
-        local layers_ptr = player:get_anim_layers()
-        if not layers_ptr or layers_ptr == nil then
-            return nil
-        end
-        
-        return ffi.cast("C_AnimationLayer*", layers_ptr)
+        return player:get_prop("m_flLowerBodyYawTarget")
     end)
     
     if success and result then
         return result
     else
-        if cfg_logs:get() then
-            print("[Resolver] FFI Error (safe_get_animlayers): " .. tostring(result))
-        end
         return nil
     end
 end
@@ -87,54 +65,35 @@ local function get_eye_yaw(player)
     end
 end
 
--- Get specific animation layer safely
-local function get_layer(layers, index)
-    if not layers then
-        return nil
-    end
-    
-    local success, result = pcall(function()
-        return layers[index]
-    end)
-    
-    if success then
-        return result
-    else
-        if cfg_logs:get() then
-            print("[Resolver] Layer access error (get_layer): " .. tostring(result))
-        end
-        return nil
-    end
-end
-
--- Analyze animation layers for jitter patterns
-local function analyze_animlayers(player, player_index)
-    local layers = safe_get_animlayers(player)
-    if not layers then
-        return 0
-    end
-    
-    -- Focus on movement and action layers (typically layers 3, 6, 11, 12)
-    local layer_3 = get_layer(layers, 3)  -- Movement layer
-    local layer_6 = get_layer(layers, 6)  -- Action layer
-    local layer_11 = get_layer(layers, 11) -- Lean/strafe layer
-    local layer_12 = get_layer(layers, 12) -- Adjust layer
-    
-    if not layer_3 or not layer_6 or not layer_11 or not layer_12 then
+-- Analyze player for jitter patterns using props
+local function analyze_jitter(player, player_index)
+    if not player then
         return 0
     end
     
     local data = resolver_data[player_index]
     
-    -- Store layer history for pattern detection
+    -- Get current yaw and LBY
+    local current_yaw = get_eye_yaw(player)
+    local lby = get_lby(player)
+    
+    if not current_yaw or not lby then
+        return 0
+    end
+    
+    -- Calculate yaw delta (desync amount)
+    local yaw_delta = math.abs(current_yaw - lby)
+    while yaw_delta > 180 do
+        yaw_delta = yaw_delta - 360
+    end
+    yaw_delta = math.abs(yaw_delta)
+    
+    -- Store history for pattern detection
     table.insert(data.layer_history, {
-        weight_3 = layer_3.m_flWeight,
-        weight_6 = layer_6.m_flWeight,
-        weight_11 = layer_11.m_flWeight,
-        weight_12 = layer_12.m_flWeight,
-        cycle_3 = layer_3.m_flCycle,
-        cycle_11 = layer_11.m_flCycle,
-        cycle_12 = layer_12.m_flCycle
+        yaw = current_yaw,
+        lby = lby,
+        delta = yaw_delta,
+        time = global_vars.cur_time()
     })
     
     -- Keep only last 5 entries
@@ -142,54 +101,50 @@ local function analyze_animlayers(player, player_index)
         table.remove(data.layer_history, 1)
     end
     
-    -- Calculate correction based on layer weights and cycles
     local correction = 0
     
-    -- Analyze layer 11 (lean/strafe) for side detection
-    if layer_11.m_flWeight > 0.01 then
-        local lean_direction = (layer_11.m_flCycle > 0.5) and 1 or -1
-        local lean_strength = layer_11.m_flWeight * 58 -- Increased multiplier for better detection
-        correction = correction + (lean_direction * lean_strength)
-    end
-    
-    -- Analyze layer 12 (adjust) for micro-corrections
-    if layer_12.m_flWeight > 0.2 then
-        local adjust_factor = (layer_12.m_flCycle - 0.5) * 2
-        correction = correction + (adjust_factor * 35)
-    end
-    
-    -- Analyze layer 6 for action-based corrections
-    if layer_6.m_flWeight > 0.1 then
-        local action_delta = math.abs(0.5 - layer_6.m_flCycle) * 2
-        correction = correction + (action_delta * 20)
-    end
-    
-    -- Analyze layer 3 movement patterns for jitter detection
+    -- Analyze history for jitter patterns
     if #data.layer_history >= 3 then
         local curr = data.layer_history[#data.layer_history]
         local prev = data.layer_history[#data.layer_history - 1]
+        local prev2 = data.layer_history[#data.layer_history - 2]
         
-        local weight_delta = math.abs(curr.weight_3 - prev.weight_3)
-        local cycle_delta = math.abs(curr.cycle_11 - prev.cycle_11)
+        -- Calculate yaw change rate
+        local yaw_change = math.abs(curr.yaw - prev.yaw)
+        local yaw_change2 = math.abs(prev.yaw - prev2.yaw)
         
-        -- Detect rapid changes indicating jitter
-        if weight_delta > 0.15 or cycle_delta > 0.3 then
+        -- Detect jitter by rapid yaw changes
+        if yaw_change > 35 or yaw_change2 > 35 then
             data.jitter_detected = true
             data.consecutive_jitters = math.min(data.consecutive_jitters + 1, 10)
             
-            -- Alternate correction based on jitter pattern
-            if data.consecutive_jitters % 2 == 0 then
-                correction = -correction
-            end
-            
-            -- Add extra correction for heavy jitter
-            if data.consecutive_jitters > 5 then
-                correction = correction * 1.15
+            -- Determine side based on yaw delta
+            if curr.delta > 35 then
+                -- High desync, resolve to opposite side
+                local side = (curr.yaw - curr.lby) > 0 and -1 or 1
+                correction = side * 60
+                
+                -- Alternate if jittering heavily
+                if data.consecutive_jitters > 4 then
+                    if data.consecutive_jitters % 2 == 0 then
+                        correction = -correction
+                    end
+                end
+            else
+                -- Low desync, likely fake standing
+                correction = data.consecutive_jitters % 2 == 0 and 45 or -45
             end
         else
+            -- No rapid changes, decay jitter counter
             data.consecutive_jitters = math.max(data.consecutive_jitters - 1, 0)
             if data.consecutive_jitters == 0 then
                 data.jitter_detected = false
+            end
+            
+            -- Apply soft correction based on desync
+            if yaw_delta > 35 then
+                local side = (curr.yaw - curr.lby) > 0 and -1 or 1
+                correction = side * (yaw_delta * 0.8)
             end
         end
     end
@@ -264,14 +219,14 @@ local function resolve_player(player, player_index)
             return false
         end
         
-        -- Analyze animation layers for correction
-        local layer_correction = analyze_animlayers(player, player_index)
+        -- Analyze jitter patterns for correction
+        local jitter_correction = analyze_jitter(player, player_index)
         
         -- Get velocity-based correction
         local velocity_correction = get_velocity_correction(player, player_index)
         
-        -- Combine corrections with weighting
-        local total_correction = (layer_correction * 0.7) + (velocity_correction * 0.3)
+        -- Combine corrections with weighting (jitter is more important)
+        local total_correction = (jitter_correction * 0.75) + (velocity_correction * 0.25)
         
         -- Clamp correction to reasonable values
         if total_correction > 60 then
