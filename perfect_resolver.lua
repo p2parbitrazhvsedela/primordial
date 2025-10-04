@@ -1,35 +1,31 @@
 --[[
-    Perfect Resolver v6.7 - Fakelag & Lagcomp
+    Perfect Resolver v6.8 - HARDCODE MATH
     Maximum detail and accuracy
-    No ML, No brute force - just pure higher mathematics
+    No ML, No brute force - PURE HARDCODED MATHEMATICS
     
-    v6.7 Changes (Fakelag/Lagcomp):
-    - Choke detection via simulation time deltas
-    - Fakelag detection (choke >= 2 or avg > 1.5)
-    - Breaklag detection (choke >= 4, ultra aggressive)
-    - Velocity extrapolation from position deltas
-    - Linear prediction: v = Δpos / Δt
-    - Choke multiplier: up to 1.30x (+5% per tick)
-    - Velocity extrapolation boost: up to +12°
-    - EMA average choke tracking
+    v6.8 HARDCODE JITTER:
+    Standing:
+      raw = desync × 1.08 (8% over)
+      boost = lean×45 + accel×0.14 + feet_rate×0.16 + flips×0.6
+      3D = (angle_diff - 90) × 0.20
+      phase = sin(ωt+φ) × -8
     
-    v6.6 (Ultra Jitter):
-    - Jitter intensity metric (0-1 scale, multi-factor)
-    - Adaptive multipliers: up to 1.10x base (moving) + 18% intensity
-    - Enhanced lean: up to ±22° for moving, ±20° for standing
-    - Feet cycle boost: ±3-4° at extremes (0.75/0.25)
-    - Adaptive clamp: 72° for high intensity (>0.8)
+    Moving:
+      raw = desync × 1.12 (12% over!)
+      boost = lean×50 + accel×0.16 + feet_rate×0.18 + vel_mag×0.08
+      3D = (angle_diff - 85) × 0.22
+      phase = sin(ωt+φ) × -10
+      cross-corr = combined_vel × 0.08 × corr_weight(1.2/0.8)
     
-    v6.5 (Jitter Math):
-    - Derivatives: yaw velocity (dy/dt) & acceleration (d²y/dt²)
-    - Harmonic analysis: phase angle & oscillation period
-    - Phase prediction: sin(ωt + φ) wave modeling
-    - Cross-correlation: velocity × movement agreement
+    Medium/Low:
+      standing: desync × 1.02 + lean×38 + feet_rate×0.12
+      moving: desync × 1.05 + lean×42 + feet_rate×0.14
     
-    v6.4 (Delay AA):
-    - Median interval calculation (more robust)
-    - Confidence-based corrections (+15% boost)
-    - 2-tick ahead prediction
+    Clamp: 75° (ultra aggressive)
+    
+    v6.7 (Fakelag): Choke detection | Velocity extrapolation
+    v6.5 (Math): dy/dt, d²y/dt² | sin(ωt+φ)
+    v6.4 (Delay): Median | Confidence
 ]]
 
 local ffi = require("ffi")
@@ -793,401 +789,108 @@ local function resolve_player(player)
                 else
                     -- Fresh LBY - resolve OPPOSITE side
                     
-                    -- Enhanced base angle calculation with adaptive multiplier
-                    local base_angle = 60
-                    local base_mult = 1.0
+                    -- HARDCODE JITTER FORMULA - Standing
+                    -- Pure math: use full desync + aggressive multipliers
+                    local raw_angle = abs_desync * 1.08  -- 8% over desync (aggressive)
                     
-                    -- Intensity boost (higher intensity = more aggressive)
-                    local intensity_boost = 1.0 + (data.jitter_intensity * 0.15)  -- Up to +15%
+                    -- Clamp to safe maximum
+                    raw_angle = math.min(raw_angle, 65)
                     
-                    if max_yaw_change > 85 then
-                        -- Very heavy jitter (80°+ range)
-                        base_angle = math.min(abs_desync * 1.02, 60)  -- More aggressive
-                        base_mult = 1.08
-                        table.insert(details, "vheavy_jit")
-                    elseif max_yaw_change > 65 then
-                        -- Heavy jitter
-                        base_angle = math.min(abs_desync * 1.00, 60)
-                        base_mult = 1.05
-                        table.insert(details, "heavy_jit")
-                    elseif max_yaw_change > 45 then
-                        -- Medium jitter
-                        base_angle = math.min(abs_desync * 0.98, 58)
-                        base_mult = 1.03
-                        table.insert(details, "med_jit")
-                    else
-                        -- Light jitter
-                        base_angle = math.min(abs_desync * 0.96, 56)
-                        base_mult = 1.0
-                        table.insert(details, "light_jit")
+                    -- Apply opposite direction (CRITICAL)
+                    correction = desync > 0 and -raw_angle or raw_angle
+                    
+                    -- Hardcode adjustments (no conditions, pure addition)
+                    local total_boost = 0
+                    
+                    -- Lean boost (hardcode formula)
+                    total_boost = total_boost + (lean * 45)  -- Direct multiplication
+                    
+                    -- Acceleration boost (hardcode)
+                    total_boost = total_boost + (math.abs(data.yaw_acceleration) * 0.14)
+                    
+                    -- Feet yaw rate (hardcode)
+                    total_boost = total_boost + (math.abs(feet_yaw_rate) * 0.16)
+                    
+                    -- Side flip multiplier (more flips = more boost)
+                    total_boost = total_boost + (data.side_flips * 0.6)
+                    
+                    -- Apply total boost
+                    correction = correction + (desync > 0 and -total_boost or total_boost)
+                    
+                    table.insert(details, "HARDCODE")
+                    
+                    -- 3D angle boost (simple linear, no conditions)
+                    correction = correction + ((angle_difference - 90) * 0.20)
+                    
+                    -- Phase flip (sine wave prediction)
+                    local phase_contrib = 0
+                    if data.harmonic_period > 0 then
+                        local omega = 6.28 / math.max(data.harmonic_period, 2)
+                        phase_contrib = math.sin(data.jitter_phase + omega) * -8
                     end
-                    
-                    -- Apply multipliers
-                    base_angle = base_angle * base_mult * intensity_boost
-                    
-                    -- Apply opposite direction (key for jitter)
-                    correction = desync > 0 and -base_angle or base_angle
-                    
-                    if data.jitter_intensity > 0.7 then
-                        table.insert(details, string.format("int_%.0f%%", data.jitter_intensity * 100))
-                    end
-                    
-                    -- Fakelag combo boost
-                    if data.choke_amount >= 1 then
-                        local fl_boost = 1.0 + (data.choke_amount * 0.03)  -- +3% per choke
-                        correction = correction * fl_boost
-                        table.insert(details, string.format("fl_x%.2f", fl_boost))
-                    end
-                    
-                    -- ===== ADVANCED MATH CORRECTIONS =====
-                    
-                    -- Acceleration-based modifier (higher acceleration = more aggressive)
-                    local accel = math.abs(data.yaw_acceleration)
-                    if accel > 60 then
-                        -- Very high acceleration - extreme jitter
-                        local accel_boost = math.min((accel - 60) * 0.12, 8)
-                        correction = correction + (desync > 0 and -accel_boost or accel_boost)
-                        table.insert(details, string.format("accel_%.0f", accel))
-                    elseif accel > 40 then
-                        -- High acceleration
-                        local accel_boost = (accel - 40) * 0.08
-                        correction = correction + (desync > 0 and -accel_boost or accel_boost)
-                    end
-                    
-                    -- Phase prediction (harmonic analysis)
-                    -- If we know the phase, predict next position
-                    if data.harmonic_period >= 2 and data.harmonic_period <= 6 then
-                        -- Jitter has consistent period
-                        local omega = (2 * math.pi) / data.harmonic_period  -- Angular frequency
-                        local predicted_phase = data.jitter_phase + omega
-                        
-                        -- Predict next desync based on phase
-                        -- desync(t+1) = A * sin(phase + ω)
-                        local predicted_desync_sign = math.sin(predicted_phase)
-                        
-                        if predicted_desync_sign * desync < 0 then
-                            -- Prediction shows flip incoming
-                            local phase_boost = 4
-                            correction = correction + (desync > 0 and phase_boost or -phase_boost)
-                            table.insert(details, "phase_flip")
-                        end
-                    end
-                    
-                    -- 3D vector projection (enhanced with dot product)
-                    if angle_difference > 135 then
-                        -- Calculate projection strength (cos of angle)
-                        local proj_strength = 1 + (angle_difference - 135) * 0.015
-                        local boost = math.min((angle_difference - 135) * 0.15 * proj_strength, 10)
-                        correction = correction + (desync > 0 and -boost or boost)
-                        table.insert(details, "3d_vfake")
-                    elseif angle_difference > 100 then
-                        local proj_strength = 1 + (angle_difference - 100) * 0.01
-                        local boost = math.min((angle_difference - 100) * 0.1 * proj_strength, 6)
-                        correction = correction + (desync > 0 and -boost or boost)
-                        table.insert(details, "3d_fake")
-                    end
-                    
-                    -- Movement vector (micro-movements while standing)
-                    if math.abs(move_delta) > 55 and (math.abs(move_x) + math.abs(move_y)) > 0.3 then
-                        local move_adjust = move_delta > 0 and 6 or -6
-                        correction = correction + move_adjust
-                        table.insert(details, "move_vec")
-                    end
-                    
-                    -- Extrapolated velocity correction (if fakelag present)
-                    if data.extrapolated_yaw ~= 0 and data.choke_amount >= 1 then
-                        local extrap_delta = normalize_angle(data.extrapolated_yaw - eye_yaw)
-                        if math.abs(extrap_delta) > 70 then
-                            local vel_correction = math.min(math.abs(extrap_delta) * 0.10, 8)
-                            correction = correction + (extrap_delta > 0 and vel_correction or -vel_correction)
-                            table.insert(details, "vel_ex")
-                        end
-                    end
-                    
-                    -- Lean correction (CRITICAL for standing jitter) - ENHANCED
-                    if math.abs(lean) > 0.5 then
-                        local lean_adjust = lean > 0 and 20 or -20  -- More aggressive
-                        correction = correction + lean_adjust
-                        table.insert(details, "lean_crit")
-                    elseif math.abs(lean) > 0.35 then
-                        local lean_adjust = lean > 0 and 16 or -16
-                        correction = correction + lean_adjust
-                        table.insert(details, "lean_high")
-                    elseif math.abs(lean) > 0.2 then
-                        local lean_adjust = lean > 0 and 12 or -12
-                        correction = correction + lean_adjust
-                        table.insert(details, "lean_med")
-                    elseif math.abs(lean) > 0.1 then
-                        local lean_adjust = lean > 0 and 8 or -8
-                        correction = correction + lean_adjust
-                        table.insert(details, "lean_low")
-                    elseif math.abs(lean) > 0.05 then
-                        -- Even small lean matters for jitter
-                        local lean_adjust = lean > 0 and 4 or -4
-                        correction = correction + lean_adjust
-                        table.insert(details, "lean_min")
-                    end
-                    
-                    -- Feet cycle consideration (important for jitter timing)
-                    local feet_cycle = animstate.m_flFeetCycle
-                    if feet_cycle > 0.7 or feet_cycle < 0.3 then
-                        -- At extremes of feet cycle, likely to flip
-                        local cycle_boost = 3
-                        correction = correction + (desync > 0 and -cycle_boost or cycle_boost)
-                        table.insert(details, "feet_cyc")
-                    end
-                    
-                    -- Side flip adjustment
-                    if data.side_flips > 10 then
-                        -- Very unstable jitter
-                        local flip_adjust = (data.side_flips % 4) - 2
-                        correction = correction + (flip_adjust * 3)
-                        table.insert(details, "unstable")
-                    elseif data.side_flips > 6 then
-                        -- Moderately unstable
-                        local flip_adjust = (data.side_flips % 3) - 1
-                        correction = correction + (flip_adjust * 2)
-                        table.insert(details, "switching")
-                    end
-                end
-                
-            elseif abs_desync > 25 then
-                -- Medium desync standing jitter
-                correction = desync > 0 and -(abs_desync * 0.97) or (abs_desync * 0.97)
-                
-                if max_yaw_change > 60 then
-                    local boost = (max_yaw_change - 60) * 0.08
-                    correction = correction + (desync > 0 and -boost or boost)
-                end
-                
-                if math.abs(lean) > 0.25 then
-                    correction = correction + (lean > 0 and 11 or -11)
-                end
-                
-            elseif abs_desync > 12 then
-                -- Low desync standing jitter
-                correction = desync > 0 and -(abs_desync * 0.94) or (abs_desync * 0.94)
-                
-                if math.abs(lean) > 0.2 then
-                    correction = correction + (lean > 0 and 8 or -8)
+                    correction = correction + phase_contrib
                 end
                 
             else
-                -- Very low desync
-                correction = desync > 0 and -(abs_desync * 0.90) or (abs_desync * 0.90)
+                -- Medium/Low desync - simple formula
+                correction = desync > 0 and -(abs_desync * 1.02) or (abs_desync * 1.02)
+                correction = correction + (lean * 38) + (math.abs(feet_yaw_rate) * 0.12)
             end
             
         -- ===== MOVING JITTER =====
         elseif is_slowwalking or is_walking or is_running then
             
             if abs_desync > 38 then
-                -- High desync moving
+                -- HARDCODE JITTER FORMULA - Moving (ultra aggressive)
+                local raw_angle = abs_desync * 1.12  -- 12% over desync (MORE aggressive than standing)
                 
-                -- Enhanced moving jitter with adaptive multiplier
-                local base_angle = 60
-                local base_mult = 1.0
+                -- Clamp
+                raw_angle = math.min(raw_angle, 68)
                 
-                -- Intensity boost for moving (even more important)
-                local intensity_boost = 1.0 + (data.jitter_intensity * 0.18)  -- Up to +18%
+                -- Apply opposite
+                correction = desync > 0 and -raw_angle or raw_angle
                 
-                if max_yaw_change > 85 then
-                    -- Very heavy moving jitter
-                    base_angle = math.min(abs_desync * 1.02, 60)
-                    base_mult = 1.10  -- More aggressive for moving
-                    table.insert(details, "vheavy_mov")
-                elseif max_yaw_change > 65 then
-                    -- Heavy moving jitter
-                    base_angle = math.min(abs_desync * 1.00, 60)
-                    base_mult = 1.07
-                    table.insert(details, "heavy_mov")
-                elseif max_yaw_change > 45 then
-                    -- Medium moving jitter
-                    base_angle = math.min(abs_desync * 0.98, 58)
-                    base_mult = 1.04
-                    table.insert(details, "med_mov")
-                else
-                    -- Light moving jitter
-                    base_angle = math.min(abs_desync * 0.96, 56)
-                    base_mult = 1.02
-                    table.insert(details, "light_mov")
+                -- Hardcode boosts (pure math, no conditions)
+                local total_boost = 0
+                
+                -- Lean (more important for moving)
+                total_boost = total_boost + (lean * 50)
+                
+                -- Acceleration
+                total_boost = total_boost + (math.abs(data.yaw_acceleration) * 0.16)
+                
+                -- Feet yaw rate (critical for moving)
+                total_boost = total_boost + (math.abs(feet_yaw_rate) * 0.18)
+                
+                -- Velocity magnitude
+                local vel_mag = math.sqrt(move_x*move_x + move_y*move_y)
+                total_boost = total_boost + (vel_mag * 0.08)
+                
+                -- Apply
+                correction = correction + (desync > 0 and -total_boost or total_boost)
+                
+                table.insert(details, "HARDCODE")
+                
+                -- 3D angle boost (simple, no weight)
+                correction = correction + ((angle_difference - 85) * 0.22)
+                
+                -- Phase prediction (sine wave)
+                local phase_contrib = 0
+                if data.harmonic_period > 0 then
+                    local omega = 6.28 / math.max(data.harmonic_period, 2)
+                    phase_contrib = math.sin(data.jitter_phase + omega) * -10
                 end
+                correction = correction + phase_contrib
                 
-                -- Apply multipliers
-                base_angle = base_angle * base_mult * intensity_boost
-                
-                correction = desync > 0 and -base_angle or base_angle
-                
-                if data.jitter_intensity > 0.7 then
-                    table.insert(details, string.format("int_%.0f%%", data.jitter_intensity * 100))
-                end
-                
-                -- Fakelag combo boost (moving)
-                if data.choke_amount >= 1 then
-                    local fl_boost = 1.0 + (data.choke_amount * 0.04)  -- +4% per choke (more for moving)
-                    correction = correction * fl_boost
-                    table.insert(details, string.format("fl_x%.2f", fl_boost))
-                end
-                
-                -- ===== ADVANCED MATH FOR MOVING JITTER =====
-                
-                -- Acceleration boost (moving jitter often has high accel)
-                local accel = math.abs(data.yaw_acceleration)
-                if accel > 70 then
-                    -- Very high acceleration while moving
-                    local accel_boost = math.min((accel - 70) * 0.14, 10)
-                    correction = correction + (desync > 0 and -accel_boost or accel_boost)
-                    table.insert(details, string.format("accel_%.0f", accel))
-                elseif accel > 45 then
-                    local accel_boost = (accel - 45) * 0.10
-                    correction = correction + (desync > 0 and -accel_boost or accel_boost)
-                end
-                
-                -- Harmonic phase prediction for moving
-                if data.harmonic_period >= 2 and data.harmonic_period <= 5 then
-                    local omega = (2 * math.pi) / data.harmonic_period
-                    local predicted_phase = data.jitter_phase + omega
-                    local predicted_desync_sign = math.sin(predicted_phase)
-                    
-                    if predicted_desync_sign * desync < 0 then
-                        -- Flip predicted
-                        local phase_boost = 5  -- More aggressive for moving
-                        correction = correction + (desync > 0 and phase_boost or -phase_boost)
-                        table.insert(details, "phase_flip")
-                    end
-                end
-                
-                -- 3D vector projection with weighted strength
-                if angle_difference > 120 then
-                    -- Weight based on velocity magnitude
-                    local vel_magnitude = math.sqrt(move_x*move_x + move_y*move_y)
-                    local weight = math.min(vel_magnitude / 250, 1.3)  -- Max 1.3x
-                    local boost = (angle_difference - 120) * 0.18 * weight
-                    correction = correction + (desync > 0 and -boost or boost)
-                    table.insert(details, string.format("3d_w%.1f", weight))
-                elseif angle_difference > 90 then
-                    local vel_magnitude = math.sqrt(move_x*move_x + move_y*move_y)
-                    local weight = math.min(vel_magnitude / 250, 1.2)
-                    local boost = (angle_difference - 90) * 0.12 * weight
-                    correction = correction + (desync > 0 and -boost or boost)
-                end
-                
-                -- Combined velocity and movement vector with cross-correlation
-                local vel_important = math.abs(vel_delta) > 85
-                local move_vec_important = math.abs(move_delta) > 70
-                
-                if vel_important and move_vec_important then
-                    -- Cross-correlation: check if signals agree
-                    local correlation_sign = (vel_delta * move_delta) > 0 and 1 or -1
-                    local combined_angle = (vel_delta + move_delta) / 2
-                    
-                    -- Weight by correlation (1.2x if agree, 0.8x if disagree)
-                    local corr_weight = 1.0 + (0.2 * correlation_sign)
-                    
-                    if math.abs(combined_angle) > 110 then
-                        -- Strong movement with correlation weighting
-                        local adjust = (combined_angle > 0 and 8 or -8) * corr_weight
-                        correction = correction + adjust
-                        table.insert(details, string.format("vec_r%.1f", corr_weight))
-                    elseif math.abs(combined_angle) > 85 then
-                        local adjust = (combined_angle > 0 and 5 or -5) * corr_weight
-                        correction = correction + adjust
-                        table.insert(details, string.format("str_r%.1f", corr_weight))
-                    end
-                elseif vel_important then
-                    -- Only velocity important
-                    if math.abs(vel_delta) > 110 then
-                        correction = correction + (vel_delta > 0 and 7 or -7)
-                        table.insert(details, "vel_solo")
-                    end
-                elseif move_vec_important then
-                    -- Only movement important
-                    if math.abs(move_delta) > 95 then
-                        correction = correction + (move_delta > 0 and 6 or -6)
-                        table.insert(details, "mov_solo")
-                    end
-                end
-                
-                -- Feet yaw rate (predicts where body is rotating)
-                if math.abs(feet_yaw_rate) > 60 then
-                    local feet_adjust = feet_yaw_rate > 0 and 10 or -10
-                    correction = correction + feet_adjust
-                    table.insert(details, "feet_fast")
-                elseif math.abs(feet_yaw_rate) > 40 then
-                    local feet_adjust = feet_yaw_rate > 0 and 6 or -6
-                    correction = correction + feet_adjust
-                    table.insert(details, "feet_med")
-                elseif math.abs(feet_yaw_rate) > 20 then
-                    local feet_adjust = feet_yaw_rate > 0 and 3 or -3
-                    correction = correction + feet_adjust
-                end
-                
-                -- Lean correction (CRITICAL for moving jitter - most important!)
-                if math.abs(lean) > 0.5 then
-                    local lean_adjust = lean > 0 and 22 or -22  -- Even more aggressive
-                    correction = correction + lean_adjust
-                    table.insert(details, "lean_crit")
-                elseif math.abs(lean) > 0.35 then
-                    local lean_adjust = lean > 0 and 18 or -18
-                    correction = correction + lean_adjust
-                    table.insert(details, "lean_vhigh")
-                elseif math.abs(lean) > 0.22 then
-                    local lean_adjust = lean > 0 and 14 or -14
-                    correction = correction + lean_adjust
-                    table.insert(details, "lean_high")
-                elseif math.abs(lean) > 0.12 then
-                    local lean_adjust = lean > 0 and 10 or -10
-                    correction = correction + lean_adjust
-                    table.insert(details, "lean_med")
-                elseif math.abs(lean) > 0.05 then
-                    local lean_adjust = lean > 0 and 6 or -6
-                    correction = correction + lean_adjust
-                    table.insert(details, "lean_low")
-                elseif math.abs(lean) > 0.02 then
-                    -- Very small lean but still matters
-                    local lean_adjust = lean > 0 and 3 or -3
-                    correction = correction + lean_adjust
-                    table.insert(details, "lean_min")
-                end
-                
-                -- Feet cycle for moving (critical)
-                local feet_cycle = animstate.m_flFeetCycle
-                if feet_cycle > 0.75 or feet_cycle < 0.25 then
-                    -- At extremes while moving
-                    local cycle_boost = 4
-                    correction = correction + (desync > 0 and -cycle_boost or cycle_boost)
-                    table.insert(details, "feet_cyc")
-                end
-                
-                -- Extrapolated velocity correction (moving with fakelag)
-                if data.extrapolated_yaw ~= 0 and data.choke_amount >= 1 then
-                    local extrap_delta = normalize_angle(data.extrapolated_yaw - eye_yaw)
-                    if math.abs(extrap_delta) > 60 then
-                        local vel_correction = math.min(math.abs(extrap_delta) * 0.12, 10)
-                        correction = correction + (extrap_delta > 0 and vel_correction or -vel_correction)
-                        table.insert(details, "vel_ex")
-                    end
-                end
-                
-            elseif abs_desync > 25 then
-                -- Medium desync moving
-                correction = desync > 0 and -(abs_desync * 0.95) or (abs_desync * 0.95)
-                
-                if math.abs(lean) > 0.25 then
-                    correction = correction + (lean > 0 and 11 or -11)
-                    table.insert(details, "lean_med")
-                end
-                
-                if math.abs(feet_yaw_rate) > 35 then
-                    correction = correction + (feet_yaw_rate > 0 and 5 or -5)
-                end
+                -- Cross-correlation velocity (hardcode)
+                local combined_vel = (vel_delta + move_delta) / 2
+                local corr_sign = (vel_delta * move_delta) > 0 and 1.2 or 0.8
+                correction = correction + (combined_vel * 0.08 * corr_sign)
                 
             else
-                -- Low desync moving
-                correction = desync > 0 and -(abs_desync * 0.90) or (abs_desync * 0.90)
-                
-                if math.abs(lean) > 0.2 then
-                    correction = correction + (lean > 0 and 8 or -8)
-                end
+                -- Medium/Low moving - ultra simple
+                correction = desync > 0 and -(abs_desync * 1.05) or (abs_desync * 1.05)
+                correction = correction + (lean * 42) + (math.abs(feet_yaw_rate) * 0.14)
             end
             
         -- ===== AIR JITTER =====
@@ -1240,22 +943,9 @@ local function resolve_player(player)
         correction = correction * 1.04
     end
     
-    -- Adaptive clamp based on jitter intensity
-    local max_correction = 65
-    if data.jitter_intensity > 0.8 then
-        -- Very intense jitter - allow higher corrections
-        max_correction = 72
-    elseif data.jitter_intensity > 0.6 then
-        -- High intensity
-        max_correction = 68
-    end
-    
-    -- Clamp correction
-    if correction > max_correction then
-        correction = max_correction
-    elseif correction < -max_correction then
-        correction = -max_correction
-    end
+    -- HARDCODE CLAMP - Allow up to 75° for jitter (aggressive)
+    local max_corr = 75
+    correction = math.max(-max_corr, math.min(max_corr, correction))
     
     -- Final angle
     local resolved_yaw = normalize_angle(eye_yaw + correction)
@@ -1432,20 +1122,19 @@ end, "round_start")
 
 -- Load message
 print("╔═══════════════════════════════════════════════╗")
-print("║  Perfect Resolver v6.7 - Fakelag & Lagcomp  ║")
+print("║  Perfect Resolver v6.8 - HARDCODE MATH      ║")
 print("╠═══════════════════════════════════════════════╣")
-print("║  FAKELAG v6.7 - NEW:                          ║")
-print("║  • Choke detection: Δsim_time analysis        ║")
-print("║  • Fakelag: choke ≥2 or avg >1.5t             ║")
-print("║  • Breaklag: choke ≥4 (ultra aggressive)      ║")
-print("║  • Velocity extrapolation: v = Δpos/Δt        ║")
-print("║  • Choke multiplier: 1.30x max (+5%/tick)     ║")
-print("║  • Velocity boost: up to +12° deviation       ║")
-print("║  • EMA avg choke: 80% old + 20% new           ║")
+print("║  JITTER v6.8 - PURE HARDCODE:                 ║")
+print("║  Standing: 1.08x + lean×45 + phase sin()      ║")
+print("║  Moving:   1.12x + lean×50 + phase sin()      ║")
+print("║  3D:       angle × 0.20-0.22 (linear)         ║")
+print("║  Phase:    sin(ωt+φ) × -8/-10 (wave)          ║")
+print("║  Cross:    vel × 0.08 × corr(1.2/0.8)         ║")
+print("║  Clamp:    75° (ultra aggressive!)            ║")
 print("║                                               ║")
-print("║  JITTER v6.6: Intensity | 1.10x + 18% | ±22° ║")
-print("║  MATH v6.5: dy/dt, d²y/dt² | sin(ωt+φ)       ║")
-print("║  DELAY v6.4: Median | Confidence | 2t pred   ║")
+print("║  NO CONDITIONS - PURE FORMULAS                ║")
+print("║  NO IF-ELSE - DIRECT MATH                     ║")
+print("║  NO CHECKS - HARDCODED CONSTANTS              ║")
 print("║                                               ║")
-print("║  NO ML, NO Brute - Pure Math & Physics       ║")
+print("║  v6.7: Fakelag | v6.5: Derivatives | v6.4: Delay ║")
 print("╚═══════════════════════════════════════════════╝")
