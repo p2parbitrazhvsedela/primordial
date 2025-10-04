@@ -38,8 +38,21 @@ local function get_lby(player)
         return nil
     end
     
+    -- Try m_flLowerBodyYawTarget first
     local success, result = pcall(function()
-        return player:get_prop("m_flLowerBodyYawTarget")
+        local lby = player:get_prop("m_flLowerBodyYawTarget")
+        if lby and lby ~= 0 then
+            return lby
+        end
+        
+        -- Fallback: try to get from poses or other props
+        local poses = player:get_prop("m_flPoseParameter")
+        if poses and poses[11] then
+            -- Pose parameter 11 is related to body yaw
+            return poses[11] * 180 - 180
+        end
+        
+        return nil
     end)
     
     if success and result then
@@ -126,13 +139,74 @@ local function analyze_jitter(player, player_index)
     local duck_amount = get_duck_amount(player)
     local standing = is_standing(player)
     
-    if not current_yaw or not lby then
+    if not current_yaw then
+        if cfg_logs:get() then
+            print("[Resolver] Failed to get eye yaw for player " .. tostring(player_index))
+        end
+        return 0
+    end
+    
+    -- If LBY unavailable, use yaw-based resolution
+    if not lby then
+        -- Fallback: analyze yaw changes without LBY
+        table.insert(data.layer_history, {
+            yaw = current_yaw,
+            lby = current_yaw, -- Use yaw as LBY fallback
+            delta = 0,
+            delta_signed = 0,
+            standing = standing,
+            duck = duck_amount,
+            time = global_vars.cur_time(),
+            no_lby = true
+        })
+        
+        if #data.layer_history > 6 then
+            table.remove(data.layer_history, 1)
+        end
+        
+        -- Simple jitter detection based on yaw changes only
+        if #data.layer_history >= 3 then
+            local curr = data.layer_history[#data.layer_history]
+            local prev = data.layer_history[#data.layer_history - 1]
+            
+            local yaw_change = math.abs(curr.yaw - prev.yaw)
+            
+            if yaw_change > 35 then
+                data.jitter_detected = true
+                data.consecutive_jitters = math.min(data.consecutive_jitters + 1, 15)
+                
+                -- Alternate sides based on consecutive jitters
+                local correction = data.consecutive_jitters % 2 == 0 and 58 or -58
+                
+                -- Boost for heavy jitter
+                if data.consecutive_jitters > 7 then
+                    correction = correction * 1.1
+                end
+                
+                return correction
+            else
+                data.consecutive_jitters = math.max(data.consecutive_jitters - 1, 0)
+                if data.consecutive_jitters == 0 then
+                    data.jitter_detected = false
+                end
+            end
+        end
+        
         return 0
     end
     
     -- Calculate yaw delta (desync amount)
     local yaw_delta = normalize_angle(current_yaw - lby)
     local abs_delta = math.abs(yaw_delta)
+    
+    -- Debug: log raw values occasionally
+    if cfg_logs:get() and math.random(1, 60) == 1 then
+        print(string.format("[Resolver Debug] Player %d | Eye: %.1f | LBY: %.1f | Delta: %.1f", 
+            tostring(player_index), 
+            tostring(current_yaw), 
+            tostring(lby), 
+            tostring(abs_delta)))
+    end
     
     -- Detect LBY update
     local lby_updated = math.abs(lby - data.last_lby) > 5
@@ -388,16 +462,25 @@ local function resolve_player(player, player_index)
                 player_name = "ID:" .. tostring(player_index)
             end
             
-            -- Get LBY for logging
-            local lby = get_lby(player)
-            local desync = lby and math.floor(math.abs(current_yaw - lby)) or 0
+            -- Get desync from history (more accurate)
+            local desync = 0
+            local lby_info = ""
+            if #data.layer_history > 0 then
+                local last_record = data.layer_history[#data.layer_history]
+                if last_record then
+                    desync = math.floor(last_record.delta or 0)
+                    local lby_age = global_vars.cur_time() - data.last_lby_update
+                    lby_info = string.format(" | LBY: %.1fs", lby_age)
+                end
+            end
             
             local log_msg = string.format(
-                "[Resolver] %s | Yaw: %.1f→%.1f | Desync: %d° | Mode: %s | Miss: %d",
+                "[Resolver] %s | Yaw: %.1f→%.1f | Desync: %d°%s | Mode: %s | Miss: %d",
                 tostring(player_name),
                 tostring(current_yaw),
                 tostring(resolved_yaw),
                 tostring(desync),
+                lby_info,
                 data.jitter_detected and (data.miss_count > 2 and "BRUTE" or "JITTER") or "SOFT",
                 tostring(data.miss_count)
             )
