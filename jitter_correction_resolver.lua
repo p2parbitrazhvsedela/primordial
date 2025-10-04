@@ -146,12 +146,12 @@ local function analyze_jitter(player, player_index)
         return 0
     end
     
-    -- If LBY unavailable, use yaw-based resolution
+    -- If LBY unavailable, use enhanced yaw-based resolution
     if not lby then
         -- Fallback: analyze yaw changes without LBY
         table.insert(data.layer_history, {
             yaw = current_yaw,
-            lby = current_yaw, -- Use yaw as LBY fallback
+            lby = current_yaw,
             delta = 0,
             delta_signed = 0,
             standing = standing,
@@ -164,30 +164,78 @@ local function analyze_jitter(player, player_index)
             table.remove(data.layer_history, 1)
         end
         
-        -- Simple jitter detection based on yaw changes only
+        -- Enhanced jitter detection based on yaw patterns
         if #data.layer_history >= 3 then
             local curr = data.layer_history[#data.layer_history]
             local prev = data.layer_history[#data.layer_history - 1]
+            local prev2 = data.layer_history[#data.layer_history - 2]
             
             local yaw_change = math.abs(curr.yaw - prev.yaw)
+            local yaw_change2 = math.abs(prev.yaw - prev2.yaw)
             
-            if yaw_change > 35 then
+            -- Calculate yaw direction changes
+            local dir_curr = normalize_angle(curr.yaw - prev.yaw)
+            local dir_prev = normalize_angle(prev.yaw - prev2.yaw)
+            local direction_flip = (dir_curr * dir_prev) < 0
+            
+            -- Detect jitter by multiple signals
+            if yaw_change > 30 or (yaw_change > 20 and direction_flip) then
                 data.jitter_detected = true
                 data.consecutive_jitters = math.min(data.consecutive_jitters + 1, 15)
                 
-                -- Alternate sides based on consecutive jitters
-                local correction = data.consecutive_jitters % 2 == 0 and 58 or -58
+                local correction = 0
                 
-                -- Boost for heavy jitter
-                if data.consecutive_jitters > 7 then
-                    correction = correction * 1.1
+                -- Brute force if many misses
+                if data.miss_count > 2 then
+                    data.brute_phase = (data.brute_phase + 1) % 3
+                    if data.brute_phase == 0 then
+                        correction = 60
+                    elseif data.brute_phase == 1 then
+                        correction = -60
+                    else
+                        correction = 0
+                    end
+                else
+                    -- Smart alternating based on jitter pattern
+                    if standing then
+                        -- Standing jitter - more aggressive
+                        correction = data.consecutive_jitters % 2 == 0 and 58 or -58
+                        
+                        -- Add randomness for heavy jitter
+                        if data.consecutive_jitters > 6 then
+                            local phase = data.consecutive_jitters % 4
+                            if phase == 0 then correction = 60
+                            elseif phase == 1 then correction = -60
+                            elseif phase == 2 then correction = 45
+                            else correction = -45 end
+                        end
+                    else
+                        -- Moving jitter
+                        correction = data.consecutive_jitters % 2 == 0 and 52 or -52
+                    end
+                    
+                    -- Consider yaw change magnitude
+                    if yaw_change > 80 then
+                        correction = correction * 1.15
+                    end
                 end
+                
+                -- Clamp
+                if correction > 60 then correction = 60 end
+                if correction < -60 then correction = -60 end
                 
                 return correction
             else
+                -- Decay jitter counter
                 data.consecutive_jitters = math.max(data.consecutive_jitters - 1, 0)
                 if data.consecutive_jitters == 0 then
                     data.jitter_detected = false
+                    data.miss_count = 0
+                end
+                
+                -- Soft correction for medium yaw changes
+                if yaw_change > 15 and yaw_change < 30 then
+                    return dir_curr > 0 and -30 or 30
                 end
             end
         end
@@ -199,13 +247,59 @@ local function analyze_jitter(player, player_index)
     local yaw_delta = normalize_angle(current_yaw - lby)
     local abs_delta = math.abs(yaw_delta)
     
-    -- Debug: log raw values occasionally
-    if cfg_logs:get() and math.random(1, 60) == 1 then
-        print(string.format("[Resolver Debug] Player %d | Eye: %.1f | LBY: %.1f | Delta: %.1f", 
-            tostring(player_index), 
-            tostring(current_yaw), 
-            tostring(lby), 
-            tostring(abs_delta)))
+    -- Debug: log raw values to understand LBY behavior
+    if cfg_logs:get() then
+        local debug_chance = math.random(1, 30)
+        if debug_chance == 1 then
+            print(string.format("[Debug] Plr%d | Eye: %.1f | LBY: %.1f | Delta: %.1f", 
+                tostring(player_index), 
+                tostring(current_yaw), 
+                tostring(lby), 
+                tostring(abs_delta)))
+        end
+    end
+    
+    -- If LBY equals yaw (no useful desync info), use yaw-only mode
+    if abs_delta < 0.5 then
+        if cfg_logs:get() and math.random(1, 90) == 1 then
+            print(string.format("[Resolver] Player %d: LBY=Yaw (%.1f), using yaw-only mode", tostring(player_index), tostring(lby)))
+        end
+        
+        -- Use the enhanced fallback logic inline
+        table.insert(data.layer_history, {
+            yaw = current_yaw,
+            lby = current_yaw,
+            delta = 0,
+            delta_signed = 0,
+            standing = standing,
+            duck = duck_amount,
+            time = global_vars.cur_time(),
+            no_lby = true
+        })
+        
+        if #data.layer_history > 6 then
+            table.remove(data.layer_history, 1)
+        end
+        
+        -- Jitter detection without LBY
+        if #data.layer_history >= 3 then
+            local curr_hist = data.layer_history[#data.layer_history]
+            local prev_hist = data.layer_history[#data.layer_history - 1]
+            local yaw_change_noLBY = math.abs(curr_hist.yaw - prev_hist.yaw)
+            
+            if yaw_change_noLBY > 30 then
+                data.jitter_detected = true
+                data.consecutive_jitters = math.min(data.consecutive_jitters + 1, 15)
+                
+                local corr = data.consecutive_jitters % 2 == 0 and 58 or -58
+                if data.consecutive_jitters > 6 then
+                    corr = corr * 1.1
+                end
+                return math.floor(corr)
+            end
+        end
+        
+        return 0
     end
     
     -- Detect LBY update
@@ -462,26 +556,47 @@ local function resolve_player(player, player_index)
                 player_name = "ID:" .. tostring(player_index)
             end
             
-            -- Get desync from history (more accurate)
+            -- Get desync and mode info from history
             local desync = 0
-            local lby_info = ""
+            local mode_info = ""
+            local is_fallback = false
+            
             if #data.layer_history > 0 then
                 local last_record = data.layer_history[#data.layer_history]
                 if last_record then
                     desync = math.floor(last_record.delta or 0)
-                    local lby_age = global_vars.cur_time() - data.last_lby_update
-                    lby_info = string.format(" | LBY: %.1fs", lby_age)
+                    is_fallback = last_record.no_lby or false
+                    
+                    if not is_fallback then
+                        local lby_age = global_vars.cur_time() - data.last_lby_update
+                        mode_info = string.format(" | LBY: %.1fs", lby_age)
+                    else
+                        mode_info = " | YAW-ONLY"
+                    end
                 end
             end
             
+            local mode_str = "SOFT"
+            if data.jitter_detected then
+                if data.miss_count > 2 then
+                    mode_str = "BRUTE"
+                elseif is_fallback then
+                    mode_str = "JIT-FALLBACK"
+                else
+                    mode_str = "JITTER"
+                end
+            elseif is_fallback then
+                mode_str = "FALLBACK"
+            end
+            
             local log_msg = string.format(
-                "[Resolver] %s | Yaw: %.1f→%.1f | Desync: %d°%s | Mode: %s | Miss: %d",
+                "[Resolver] %s | %.1f→%.1f | Δ%d°%s | %s | M:%d",
                 tostring(player_name),
                 tostring(current_yaw),
                 tostring(resolved_yaw),
                 tostring(desync),
-                lby_info,
-                data.jitter_detected and (data.miss_count > 2 and "BRUTE" or "JITTER") or "SOFT",
+                mode_info,
+                mode_str,
                 tostring(data.miss_count)
             )
             print(log_msg)
