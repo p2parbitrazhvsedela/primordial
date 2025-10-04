@@ -322,12 +322,13 @@ local function resolve_player(player)
     -- Update jitter metrics
     data.jitter_amplitude = max_yaw_change
     
-    -- Jitter detection with multiple conditions
+    -- Jitter detection with multiple conditions (more sensitive)
     local is_jittering = 
-        (yaw_change > 35) or                           -- Large yaw change
-        (yaw_change > 28 and side_flip) or            -- Medium change with flip
+        (yaw_change > 25) or                           -- Large yaw change (lowered)
+        (yaw_change > 18 and side_flip) or            -- Medium change with flip
         (double_flip) or                               -- Double side flip
-        (desync_change > 35)                          -- Large desync change
+        (desync_change > 25) or                       -- Large desync change
+        (yaw_change > 15 and yaw_change_prev > 15)    -- Consistent changes
     
     data.jitter_detected = is_jittering
     
@@ -431,61 +432,61 @@ local function resolve_player(player)
                 else
                     -- Fresh LBY - resolve OPPOSITE side
                     
-                    -- Base angle depends on jitter amplitude (optimized for accuracy)
-                    local base_angle = 58
-                    if max_yaw_change > 90 then
-                        -- Extreme jitter
-                        base_angle = 60
-                        table.insert(details, "extreme_jitter")
-                    elseif max_yaw_change > 75 then
-                        -- Very heavy jitter (80° range common)
-                        base_angle = 59
-                        table.insert(details, "vheavy_jitter")
-                    elseif max_yaw_change > 60 then
+                    -- Enhanced base angle calculation for maximum accuracy
+                    local base_angle = 60  -- More aggressive default
+                    
+                    if max_yaw_change > 85 then
+                        -- Very heavy jitter (80°+ range)
+                        -- Use maximum desync as base
+                        base_angle = math.min(abs_desync, 60)
+                        table.insert(details, "vheavy_jit")
+                    elseif max_yaw_change > 65 then
                         -- Heavy jitter
-                        base_angle = 58
-                        table.insert(details, "heavy_jitter")
+                        base_angle = math.min(abs_desync * 0.98, 60)
+                        table.insert(details, "heavy_jit")
                     elseif max_yaw_change > 45 then
                         -- Medium jitter
-                        base_angle = 57
-                        table.insert(details, "medium_jitter")
-                    elseif max_yaw_change > 30 then
-                        -- Light jitter
-                        base_angle = 56
-                        table.insert(details, "light_jitter")
+                        base_angle = math.min(abs_desync * 0.95, 58)
+                        table.insert(details, "med_jit")
                     else
-                        -- Very light
-                        base_angle = 54
-                        table.insert(details, "vlight_jitter")
+                        -- Light jitter
+                        base_angle = math.min(abs_desync * 0.92, 56)
+                        table.insert(details, "light_jit")
                     end
                     
-                    -- Apply opposite direction
+                    -- Apply opposite direction (key for jitter)
                     correction = desync > 0 and -base_angle or base_angle
                     
-                    -- 3D vector analysis - check if enemy looking away from us
-                    if angle_difference > 140 then
-                        -- Enemy looking very far from us - likely aggressive fake
-                        correction = correction * 1.12
-                        table.insert(details, "fake_away")
+                    -- 3D vector boost (important for accuracy)
+                    if angle_difference > 135 then
+                        -- Very fake angle - boost correction
+                        local boost = math.min((angle_difference - 135) * 0.15, 8)
+                        correction = correction + (desync > 0 and -boost or boost)
+                        table.insert(details, "3d_vfake")
                     elseif angle_difference > 100 then
-                        -- Moderate fake angle
-                        correction = correction * 1.06
-                        table.insert(details, "angle_sus")
+                        -- Moderately fake
+                        local boost = math.min((angle_difference - 100) * 0.1, 5)
+                        correction = correction + (desync > 0 and -boost or boost)
+                        table.insert(details, "3d_fake")
                     end
                     
-                    -- Movement vector consideration for micro-movements
-                    if math.abs(move_delta) > 60 and (math.abs(move_x) + math.abs(move_y)) > 0.5 then
-                        local move_adjust = move_delta > 0 and 5 or -5
+                    -- Movement vector (micro-movements while standing)
+                    if math.abs(move_delta) > 55 and (math.abs(move_x) + math.abs(move_y)) > 0.3 then
+                        local move_adjust = move_delta > 0 and 6 or -6
                         correction = correction + move_adjust
                         table.insert(details, "move_vec")
                     end
                     
-                    -- Lean correction (very important for standing)
-                    if math.abs(lean) > 0.4 then
+                    -- Lean correction (CRITICAL for standing jitter)
+                    if math.abs(lean) > 0.5 then
+                        local lean_adjust = lean > 0 and 18 or -18
+                        correction = correction + lean_adjust
+                        table.insert(details, "lean_crit")
+                    elseif math.abs(lean) > 0.35 then
                         local lean_adjust = lean > 0 and 14 or -14
                         correction = correction + lean_adjust
                         table.insert(details, "lean_high")
-                    elseif math.abs(lean) > 0.25 then
+                    elseif math.abs(lean) > 0.2 then
                         local lean_adjust = lean > 0 and 10 or -10
                         correction = correction + lean_adjust
                         table.insert(details, "lean_med")
@@ -510,20 +511,29 @@ local function resolve_player(player)
                 end
                 
             elseif abs_desync > 25 then
-                -- Medium desync standing
-                correction = desync > 0 and -54 or 54
+                -- Medium desync standing jitter
+                correction = desync > 0 and -(abs_desync * 0.97) or (abs_desync * 0.97)
                 
                 if max_yaw_change > 60 then
-                    correction = correction * 1.05
+                    local boost = (max_yaw_change - 60) * 0.08
+                    correction = correction + (desync > 0 and -boost or boost)
                 end
                 
-            elseif abs_desync > 15 then
-                -- Low desync standing
-                correction = desync > 0 and -50 or 50
+                if math.abs(lean) > 0.25 then
+                    correction = correction + (lean > 0 and 11 or -11)
+                end
+                
+            elseif abs_desync > 12 then
+                -- Low desync standing jitter
+                correction = desync > 0 and -(abs_desync * 0.94) or (abs_desync * 0.94)
+                
+                if math.abs(lean) > 0.2 then
+                    correction = correction + (lean > 0 and 8 or -8)
+                end
                 
             else
                 -- Very low desync
-                correction = desync > 0 and -45 or 45
+                correction = desync > 0 and -(abs_desync * 0.90) or (abs_desync * 0.90)
             end
             
         -- ===== MOVING JITTER =====
@@ -532,25 +542,25 @@ local function resolve_player(player)
             if abs_desync > 38 then
                 -- High desync moving
                 
-                -- Base angle by jitter amplitude (optimized)
-                local base_angle = 58
-                if max_yaw_change > 90 then
-                    base_angle = 60
-                    table.insert(details, "extreme_move")
-                elseif max_yaw_change > 75 then
-                    base_angle = 59
-                    table.insert(details, "vheavy_move")
-                elseif max_yaw_change > 60 then
-                    base_angle = 58
-                    table.insert(details, "heavy_move")
+                -- Enhanced moving jitter - use desync as base
+                local base_angle = 60
+                
+                if max_yaw_change > 85 then
+                    -- Very heavy moving jitter
+                    base_angle = math.min(abs_desync, 60)
+                    table.insert(details, "vheavy_mov")
+                elseif max_yaw_change > 65 then
+                    -- Heavy moving jitter
+                    base_angle = math.min(abs_desync * 0.98, 60)
+                    table.insert(details, "heavy_mov")
                 elseif max_yaw_change > 45 then
-                    base_angle = 57
-                    table.insert(details, "med_move")
-                elseif max_yaw_change > 30 then
-                    base_angle = 56
-                    table.insert(details, "light_move")
+                    -- Medium moving jitter
+                    base_angle = math.min(abs_desync * 0.95, 58)
+                    table.insert(details, "med_mov")
                 else
-                    base_angle = 54
+                    -- Light moving jitter
+                    base_angle = math.min(abs_desync * 0.92, 56)
+                    table.insert(details, "light_mov")
                 end
                 
                 correction = desync > 0 and -base_angle or base_angle
@@ -598,32 +608,49 @@ local function resolve_player(player)
                     correction = correction + feet_adjust
                 end
                 
-                -- Lean correction (critical for moving jitter)
-                if math.abs(lean) > 0.35 then
+                -- Lean correction (CRITICAL for moving jitter - most important!)
+                if math.abs(lean) > 0.5 then
+                    local lean_adjust = lean > 0 and 20 or -20
+                    correction = correction + lean_adjust
+                    table.insert(details, "lean_crit")
+                elseif math.abs(lean) > 0.35 then
                     local lean_adjust = lean > 0 and 16 or -16
                     correction = correction + lean_adjust
+                    table.insert(details, "lean_vhigh")
+                elseif math.abs(lean) > 0.22 then
+                    local lean_adjust = lean > 0 and 13 or -13
+                    correction = correction + lean_adjust
                     table.insert(details, "lean_high")
-                elseif math.abs(lean) > 0.2 then
-                    local lean_adjust = lean > 0 and 12 or -12
+                elseif math.abs(lean) > 0.12 then
+                    local lean_adjust = lean > 0 and 9 or -9
                     correction = correction + lean_adjust
                     table.insert(details, "lean_med")
-                elseif math.abs(lean) > 0.1 then
-                    local lean_adjust = lean > 0 and 8 or -8
+                elseif math.abs(lean) > 0.05 then
+                    local lean_adjust = lean > 0 and 5 or -5
                     correction = correction + lean_adjust
                     table.insert(details, "lean_low")
                 end
                 
             elseif abs_desync > 25 then
                 -- Medium desync moving
-                correction = desync > 0 and -54 or 54
+                correction = desync > 0 and -(abs_desync * 0.95) or (abs_desync * 0.95)
                 
                 if math.abs(lean) > 0.25 then
-                    correction = correction + (lean > 0 and 10 or -10)
+                    correction = correction + (lean > 0 and 11 or -11)
+                    table.insert(details, "lean_med")
+                end
+                
+                if math.abs(feet_yaw_rate) > 35 then
+                    correction = correction + (feet_yaw_rate > 0 and 5 or -5)
                 end
                 
             else
                 -- Low desync moving
-                correction = desync > 0 and -50 or 50
+                correction = desync > 0 and -(abs_desync * 0.90) or (abs_desync * 0.90)
+                
+                if math.abs(lean) > 0.2 then
+                    correction = correction + (lean > 0 and 8 or -8)
+                end
             end
             
         -- ===== AIR JITTER =====
@@ -674,6 +701,13 @@ local function resolve_player(player)
     -- Crouching boost
     if is_crouching and correction ~= 0 then
         correction = correction * 1.04
+    end
+    
+    -- Clamp correction to prevent over-correction
+    if correction > 65 then
+        correction = 65
+    elseif correction < -65 then
+        correction = -65
     end
     
     -- Final angle
@@ -819,15 +853,20 @@ end, "round_start")
 
 -- Load message
 print("╔═══════════════════════════════════════════════╗")
-print("║  Perfect Resolver v6.2 - 3D Vector Edition   ║")
+print("║  Perfect Resolver v6.3 - Optimized           ║")
 print("╠═══════════════════════════════════════════════╣")
-print("║  ✓ Jitter anti-aim (6-tier amplitude)        ║")
-print("║  ✓ Delay anti-aim (tick-based detection)     ║")
-print("║  ✓ 3D vector position analysis                ║")
-print("║  ✓ Velocity + movement vector fusion          ║")
-print("║  ✓ LBY timing prediction                      ║")
-print("║  ✓ Feet yaw rate prediction                   ║")
-print("║  ✓ Lean micro-adjustments                     ║")
+print("║  JITTER IMPROVEMENTS:                         ║")
+print("║  • Desync-based angles (92-100% accuracy)     ║")
+print("║  • Enhanced lean (up to ±20° for moving)      ║")
+print("║  • 3D position boost (up to +8°)              ║")
+print("║  • Amplitude-adaptive (54-60° range)          ║")
+print("║  • More sensitive detection (>25° vs >35°)    ║")
 print("║                                               ║")
-print("║  NO ML, NO Brute Force - Pure Math & Logic   ║")
+print("║  ALSO INCLUDES:                               ║")
+print("║  • Delay AA (tick-based)                      ║")
+print("║  • LBY timing                                 ║")
+print("║  • Vector fusion                              ║")
+print("║  • Feet rate prediction                       ║")
+print("║                                               ║")
+print("║  NO ML, NO Brute - Pure Math                 ║")
 print("╚═══════════════════════════════════════════════╝")
