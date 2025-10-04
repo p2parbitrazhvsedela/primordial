@@ -1,42 +1,44 @@
 --[[
-    Perfect Resolver v6.9 - PURE MATHEMATICS
-    Maximum detail and accuracy
-    No ML, No brute force - CLEAN MATHEMATICAL FORMULAS
+    Perfect Resolver v7.0 - OPTIMIZED YAW CORRECTION
+    Maximum accuracy with minimal complexity
+    No ML, No patterns - PURE GEOMETRIC MATHEMATICS
     
-    v6.9 PURE MATH JITTER (PROPER SIGN HANDLING):
+    v7.0 CORE PRINCIPLE:
+    "Jitter AA shows fake yaw on one side, real body is on OPPOSITE side"
     
-    Standing High Desync:
-      base = 58° (optimal tested value)
-      correction = -base (if desync > 0) or base
-      scale = correction × (0.92 + ratio×0.16)  // ratio = desync/60
-      adjustments:
-        + lean × 32        (signed)
-        + feet_rate × 0.12 (signed)
-        + accel × 0.08     (signed)
-        ± angle_contrib × 0.16
-        ± phase_flip (6°)
-      
-    Moving High Desync:
-      base = 60°
-      correction = -base (if desync > 0) or base
-      scale = correction × (0.94 + ratio×0.14)
-      adjustments:
-        + lean × 38
-        + feet_rate × 0.14
-        + vel_direction × 0.08
-        + accel × 0.10
-        ± angle_contrib × 0.18
-        ± phase_flip (7°)
+    FORMULA (all cases):
+    ═══════════════════════════════════════════════════════════
+    1. Base correction = abs_desync (the actual body angle offset)
+    2. Direction = OPPOSITE to current desync side
+       correction = (desync > 0) ? -abs_desync : +abs_desync
     
-    Medium/Low:
-      standing: desync×0.96 + lean×28 + feet×0.10
-      moving: desync×0.98 + lean×32 + feet×0.12 + vel×0.06
+    3. LEAN adjustment (MOST IMPORTANT):
+       correction += lean × coefficient
+       - Standing: ×35
+       - Moving: ×40
+       Lean shows REAL body lean direction (±1.0 range)
     
-    Clamp: 68° (realistic game limit)
+    4. FEET YAW RATE (rotation speed):
+       correction += feet_yaw_rate × coefficient
+       - Standing: ×0.15
+       - Moving: ×0.16
+       Shows body turning speed and direction
     
-    v6.7: Fakelag detection
-    v6.5: Derivatives & Harmonic
-    v6.4: Delay AA
+    5. MOVEMENT DIRECTION (moving only):
+       move_angle = atan2(move_y, move_x)
+       move_delta = normalize(move_angle - eye_yaw)
+       correction += move_delta × 0.10
+       Body follows movement direction
+    
+    6. JITTER STRENGTH boost:
+       strength = |yaw_velocity| / 100
+       correction *= (1.0 + strength × 0.10-0.12)
+       Stronger jitter = more aggressive correction
+    
+    Clamp: 70° (max realistic with adjustments)
+    ═══════════════════════════════════════════════════════════
+    
+    v6.7: Fakelag | v6.5: Math | v6.4: Delay
 ]]
 
 local ffi = require("ffi")
@@ -800,121 +802,82 @@ local function resolve_player(player)
                 else
                     -- Fresh LBY - resolve OPPOSITE side
                     
-                    -- PURE MATH FORMULA - Standing Jitter
-                    -- Base: use 58° as optimal for jitter AA (tested value)
-                    local base_correction = 58
+                    -- OPTIMIZED FORMULA - Standing Jitter
+                    -- Key principle: resolve to OPPOSITE side with magnitude close to max desync
                     
-                    -- Direction: opposite to desync (KEY!)
-                    correction = desync > 0 and -base_correction or base_correction
+                    -- Base angle = actual desync (this is the real body angle)
+                    local target_angle = abs_desync
                     
-                    -- MATHEMATICAL ADJUSTMENTS (all signed properly)
+                    -- Direction: OPPOSITE to current eye yaw side
+                    correction = desync > 0 and -target_angle or target_angle
                     
-                    -- 1. Desync magnitude adjustment (use actual desync ratio)
-                    local desync_ratio = abs_desync / 60  -- Normalize to 0-1
-                    correction = correction * (0.92 + desync_ratio * 0.16)  -- 0.92-1.08 range
+                    -- Lean is THE MOST IMPORTANT indicator of real body direction
+                    -- Lean > 0 means body leans right, lean < 0 means left
+                    -- This adds to correction (can boost or reduce it)
+                    correction = correction + (lean * 35)
                     
-                    -- 2. Lean adjustment (CRITICAL - preserves sign)
-                    correction = correction + (lean * 32)
+                    -- Feet yaw rate shows rotation speed and direction
+                    correction = correction + (feet_yaw_rate * 0.15)
                     
-                    -- 3. Feet yaw rate (body rotation)
-                    correction = correction + (feet_yaw_rate * 0.12)
+                    -- If jitter is very aggressive (high velocity), boost correction
+                    local jitter_strength = math.abs(data.yaw_velocity) / 100  -- Normalize
+                    correction = correction * (1.0 + jitter_strength * 0.10)  -- Up to +10%
                     
-                    -- 4. Acceleration contribution
-                    correction = correction + (data.yaw_acceleration * 0.08)
-                    
-                    -- 5. 3D angle deviation (linear)
-                    local angle_contrib = (angle_difference - 90) * 0.16
-                    correction = correction + (desync > 0 and -angle_contrib or angle_contrib)
-                    
-                    -- 6. Phase prediction (harmonic)
-                    if data.harmonic_period >= 2 and data.harmonic_period <= 6 then
-                        local omega = 6.2832 / data.harmonic_period
-                        local phase_sign = math.sin(data.jitter_phase + omega)
-                        if phase_sign * desync < 0 then
-                            -- Predicted flip
-                            correction = correction + (desync > 0 and 6 or -6)
-                        end
-                    end
-                    
-                    table.insert(details, "PURE_MATH")
+                    table.insert(details, "OPT")
                 end
                 
             else
-                -- Medium/Low standing
-                -- Use actual desync value with small boost
-                local base = abs_desync * 0.96
-                correction = desync > 0 and -base or base
-                
-                -- Simple adjustments
-                correction = correction + (lean * 28)
-                correction = correction + (feet_yaw_rate * 0.10)
-                
-                table.insert(details, "med_low")
+                -- Medium/Low standing - same principle
+                correction = desync > 0 and -abs_desync or abs_desync
+                correction = correction + (lean * 30)
+                correction = correction + (feet_yaw_rate * 0.12)
             end
             
         -- ===== MOVING JITTER =====
         elseif is_slowwalking or is_walking or is_running then
             
             if abs_desync > 38 then
-                -- PURE MATH FORMULA - Moving Jitter
-                -- Base: 60° optimal for moving jitter
-                local base_correction = 60
+                -- OPTIMIZED FORMULA - Moving Jitter
+                -- While moving, body position is more predictable
                 
-                -- Direction: opposite to desync
-                correction = desync > 0 and -base_correction or base_correction
+                -- Base: actual desync
+                local target_angle = abs_desync
                 
-                -- MATHEMATICAL ADJUSTMENTS
+                -- Direction: OPPOSITE
+                correction = desync > 0 and -target_angle or target_angle
                 
-                -- 1. Desync magnitude scaling
-                local desync_ratio = abs_desync / 60
-                correction = correction * (0.94 + desync_ratio * 0.14)  -- 0.94-1.08
+                -- Lean is EVEN MORE important while moving
+                correction = correction + (lean * 40)
                 
-                -- 2. Lean (MORE important for moving, preserves sign)
-                correction = correction + (lean * 38)
+                -- Feet yaw rate (body rotation)
+                correction = correction + (feet_yaw_rate * 0.16)
                 
-                -- 3. Feet yaw rate (body turning while moving)
-                correction = correction + (feet_yaw_rate * 0.14)
-                
-                -- 4. Velocity direction vs eye yaw
-                local vel_angle = math.atan2(move_y, move_x) * 57.2958
-                local vel_eye_delta = normalize_angle(vel_angle - eye_yaw)
-                correction = correction + (vel_eye_delta * 0.08)
-                
-                -- 5. Acceleration
-                correction = correction + (data.yaw_acceleration * 0.10)
-                
-                -- 6. 3D angle
-                local angle_contrib = (angle_difference - 90) * 0.18
-                correction = correction + (desync > 0 and -angle_contrib or angle_contrib)
-                
-                -- 7. Phase prediction
-                if data.harmonic_period >= 2 and data.harmonic_period <= 6 then
-                    local omega = 6.2832 / data.harmonic_period
-                    local phase_sign = math.sin(data.jitter_phase + omega)
-                    if phase_sign * desync < 0 then
-                        correction = correction + (desync > 0 and 7 or -7)
-                    end
+                -- Movement direction matters - where is player going?
+                if math.abs(move_x) > 1 or math.abs(move_y) > 1 then
+                    local move_angle = math.atan2(move_y, move_x) * 57.2958
+                    local move_yaw_delta = normalize_angle(move_angle - eye_yaw)
+                    -- If moving perpendicular to view, body follows movement
+                    correction = correction + (move_yaw_delta * 0.10)
                 end
                 
-                table.insert(details, "PURE_MATH")
+                -- Jitter strength boost (higher for moving)
+                local jitter_strength = math.abs(data.yaw_velocity) / 100
+                correction = correction * (1.0 + jitter_strength * 0.12)  -- Up to +12%
+                
+                table.insert(details, "OPT")
                 
             else
-                -- Medium/Low moving
-                local base = abs_desync * 0.98
-                correction = desync > 0 and -base or base
+                -- Medium/Low moving - same principle
+                correction = desync > 0 and -abs_desync or abs_desync
+                correction = correction + (lean * 35)
+                correction = correction + (feet_yaw_rate * 0.14)
                 
-                -- Adjustments
-                correction = correction + (lean * 32)
-                correction = correction + (feet_yaw_rate * 0.12)
-                
-                -- Velocity direction
+                -- Movement direction
                 if math.abs(move_x) > 1 or math.abs(move_y) > 1 then
-                    local vel_angle = math.atan2(move_y, move_x) * 57.2958
-                    local vel_delta = normalize_angle(vel_angle - eye_yaw)
-                    correction = correction + (vel_delta * 0.06)
+                    local move_angle = math.atan2(move_y, move_x) * 57.2958
+                    local move_delta = normalize_angle(move_angle - eye_yaw)
+                    correction = correction + (move_delta * 0.08)
                 end
-                
-                table.insert(details, "med_low")
             end
             
         -- ===== AIR JITTER =====
@@ -967,9 +930,9 @@ local function resolve_player(player)
         correction = correction * 1.04
     end
     
-    -- CLAMP - Realistic limit based on game mechanics
-    -- Max desync in game is ~60°, with adjustments we can go to 68°
-    local max_corr = 68
+    -- CLAMP - Allow maximum possible correction
+    -- desync can be up to 60°, with lean/feet adjustments we can add ~10-15°
+    local max_corr = 70
     correction = math.max(-max_corr, math.min(max_corr, correction))
     
     -- Final angle
@@ -1147,19 +1110,21 @@ end, "round_start")
 
 -- Load message
 print("╔═══════════════════════════════════════════════╗")
-print("║  Perfect Resolver v6.9 - PURE MATHEMATICS    ║")
+print("║  Perfect Resolver v7.0 - OPTIMIZED           ║")
 print("╠═══════════════════════════════════════════════╣")
-print("║  JITTER v6.9 - CLEAN MATH:                    ║")
-print("║  Standing: 58° base × scale(0.92-1.08)        ║")
-print("║    + lean×32 + feet×0.12 + accel×0.08         ║")
-print("║    ± angle×0.16 ± phase(6°)                   ║")
+print("║  CORE PRINCIPLE:                              ║")
+print("║  Fake yaw on one side → Body on OPPOSITE     ║")
 print("║                                               ║")
-print("║  Moving: 60° base × scale(0.94-1.08)          ║")
-print("║    + lean×38 + feet×0.14 + vel_dir×0.08       ║")
-print("║    + accel×0.10 ± angle×0.18 ± phase(7°)      ║")
+print("║  FORMULA (ULTRA SIMPLE):                      ║")
+print("║  1. correction = -desync (opposite)           ║")
+print("║  2. correction += lean × 35-40 (KEY!)         ║")
+print("║  3. correction += feet_rate × 0.15-0.16       ║")
+print("║  4. correction += move_dir × 0.10 (moving)    ║")
+print("║  5. correction *= jitter_boost (1.0-1.12)     ║")
 print("║                                               ║")
-print("║  Med/Low: desync×0.96-0.98 + lean + feet      ║")
-print("║  Clamp: 68° (game realistic)                  ║")
+print("║  NO COMPLEX MATH - JUST GEOMETRY              ║")
+print("║  NO AI - JUST PHYSICS                         ║")
+print("║  NO PATTERNS - JUST REALITY                   ║")
 print("║                                               ║")
-print("║  PROPER SIGNED MATH - ALL DIRECTIONS CORRECT  ║")
+print("║  Clamp: 70° | Lean = MOST IMPORTANT           ║")
 print("╚═══════════════════════════════════════════════╝")
