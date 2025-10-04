@@ -1,9 +1,17 @@
 --[[
-    Perfect Resolver v6.4 - Delay AA Enhanced
+    Perfect Resolver v6.5 - Advanced Mathematics
     Maximum detail and accuracy
-    No ML, No brute force - just pure intelligent logic
+    No ML, No brute force - just pure higher mathematics
     
-    v6.4 Changes:
+    v6.5 Changes (Jitter Math):
+    - Derivatives: yaw velocity (dy/dt) & acceleration (d²y/dt²)
+    - Harmonic analysis: phase angle & oscillation period
+    - Phase prediction: sin(ωt + φ) wave modeling
+    - Cross-correlation: velocity × movement agreement
+    - Vector projection: weighted by magnitude & direction
+    - Acceleration-based boost: up to +10° for high d²y/dt²
+    
+    v6.4 (Delay AA):
     - Median interval calculation (more robust)
     - Confidence-based corrections (+15% boost)
     - 2-tick ahead prediction
@@ -98,6 +106,12 @@ for i = 1, 65 do
         jitter_detected = false,
         jitter_amplitude = 0,
         jitter_frequency = 0,
+        
+        -- Advanced math tracking
+        yaw_velocity = 0,        -- First derivative (dy/dt)
+        yaw_acceleration = 0,    -- Second derivative (d²y/dt²)
+        jitter_phase = 0,        -- Phase angle of jitter wave
+        harmonic_period = 0,     -- Period of oscillation
         
         -- Side tracking
         current_side = 0,
@@ -353,16 +367,47 @@ local function resolve_player(player)
     local max_yaw_change = math.max(yaw_change, yaw_change_prev)
     local avg_yaw_change = (yaw_change + yaw_change_prev) / 2
     
+    -- ===== ADVANCED MATH: DERIVATIVES & HARMONIC ANALYSIS =====
+    
+    -- Calculate yaw velocity (first derivative: dy/dt)
+    local dt = 1  -- tick interval
+    local new_velocity = yaw_change / dt
+    
+    -- Calculate yaw acceleration (second derivative: d²y/dt²)
+    local prev_velocity = data.yaw_velocity
+    data.yaw_velocity = new_velocity
+    data.yaw_acceleration = (new_velocity - prev_velocity) / dt
+    
+    -- Harmonic analysis: detect oscillation period
+    if side_flip then
+        if data.harmonic_period == 0 then
+            data.harmonic_period = 2  -- Started oscillating
+        end
+    else
+        if data.harmonic_period > 0 and data.harmonic_period < 10 then
+            data.harmonic_period = data.harmonic_period + 1
+        end
+    end
+    
+    -- Phase angle estimation (0 to 2π) based on desync position
+    -- Assuming jitter oscillates like: desync = A * sin(ωt + φ)
+    if abs_desync > 5 then
+        local normalized_desync = desync / 60  -- Normalize to -1 to 1
+        local phase_estimate = math.asin(math.max(-1, math.min(1, normalized_desync)))
+        data.jitter_phase = phase_estimate
+    end
+    
     -- Update jitter metrics
     data.jitter_amplitude = max_yaw_change
     
-    -- Jitter detection with multiple conditions (more sensitive)
+    -- Enhanced jitter detection with derivatives
     local is_jittering = 
-        (yaw_change > 25) or                           -- Large yaw change (lowered)
+        (yaw_change > 25) or                           -- Large yaw change
         (yaw_change > 18 and side_flip) or            -- Medium change with flip
         (double_flip) or                               -- Double side flip
         (desync_change > 25) or                       -- Large desync change
-        (yaw_change > 15 and yaw_change_prev > 15)    -- Consistent changes
+        (yaw_change > 15 and yaw_change_prev > 15) or -- Consistent changes
+        (math.abs(data.yaw_acceleration) > 40)        -- High acceleration (new!)
     
     data.jitter_detected = is_jittering
     
@@ -555,15 +600,50 @@ local function resolve_player(player)
                     -- Apply opposite direction (key for jitter)
                     correction = desync > 0 and -base_angle or base_angle
                     
-                    -- 3D vector boost (important for accuracy)
+                    -- ===== ADVANCED MATH CORRECTIONS =====
+                    
+                    -- Acceleration-based modifier (higher acceleration = more aggressive)
+                    local accel = math.abs(data.yaw_acceleration)
+                    if accel > 60 then
+                        -- Very high acceleration - extreme jitter
+                        local accel_boost = math.min((accel - 60) * 0.12, 8)
+                        correction = correction + (desync > 0 and -accel_boost or accel_boost)
+                        table.insert(details, string.format("accel_%.0f", accel))
+                    elseif accel > 40 then
+                        -- High acceleration
+                        local accel_boost = (accel - 40) * 0.08
+                        correction = correction + (desync > 0 and -accel_boost or accel_boost)
+                    end
+                    
+                    -- Phase prediction (harmonic analysis)
+                    -- If we know the phase, predict next position
+                    if data.harmonic_period >= 2 and data.harmonic_period <= 6 then
+                        -- Jitter has consistent period
+                        local omega = (2 * math.pi) / data.harmonic_period  -- Angular frequency
+                        local predicted_phase = data.jitter_phase + omega
+                        
+                        -- Predict next desync based on phase
+                        -- desync(t+1) = A * sin(phase + ω)
+                        local predicted_desync_sign = math.sin(predicted_phase)
+                        
+                        if predicted_desync_sign * desync < 0 then
+                            -- Prediction shows flip incoming
+                            local phase_boost = 4
+                            correction = correction + (desync > 0 and phase_boost or -phase_boost)
+                            table.insert(details, "phase_flip")
+                        end
+                    end
+                    
+                    -- 3D vector projection (enhanced with dot product)
                     if angle_difference > 135 then
-                        -- Very fake angle - boost correction
-                        local boost = math.min((angle_difference - 135) * 0.15, 8)
+                        -- Calculate projection strength (cos of angle)
+                        local proj_strength = 1 + (angle_difference - 135) * 0.015
+                        local boost = math.min((angle_difference - 135) * 0.15 * proj_strength, 10)
                         correction = correction + (desync > 0 and -boost or boost)
                         table.insert(details, "3d_vfake")
                     elseif angle_difference > 100 then
-                        -- Moderately fake
-                        local boost = math.min((angle_difference - 100) * 0.1, 5)
+                        local proj_strength = 1 + (angle_difference - 100) * 0.01
+                        local boost = math.min((angle_difference - 100) * 0.1 * proj_strength, 6)
                         correction = correction + (desync > 0 and -boost or boost)
                         table.insert(details, "3d_fake")
                     end
@@ -663,32 +743,82 @@ local function resolve_player(player)
                 
                 correction = desync > 0 and -base_angle or base_angle
                 
-                -- 3D position analysis for moving
-                if angle_difference > 120 then
-                    correction = correction * 1.10
-                    table.insert(details, "3d_fake")
-                elseif angle_difference > 90 then
-                    correction = correction * 1.05
+                -- ===== ADVANCED MATH FOR MOVING JITTER =====
+                
+                -- Acceleration boost (moving jitter often has high accel)
+                local accel = math.abs(data.yaw_acceleration)
+                if accel > 70 then
+                    -- Very high acceleration while moving
+                    local accel_boost = math.min((accel - 70) * 0.14, 10)
+                    correction = correction + (desync > 0 and -accel_boost or accel_boost)
+                    table.insert(details, string.format("accel_%.0f", accel))
+                elseif accel > 45 then
+                    local accel_boost = (accel - 45) * 0.10
+                    correction = correction + (desync > 0 and -accel_boost or accel_boost)
                 end
                 
-                -- Combined velocity and movement vector analysis
+                -- Harmonic phase prediction for moving
+                if data.harmonic_period >= 2 and data.harmonic_period <= 5 then
+                    local omega = (2 * math.pi) / data.harmonic_period
+                    local predicted_phase = data.jitter_phase + omega
+                    local predicted_desync_sign = math.sin(predicted_phase)
+                    
+                    if predicted_desync_sign * desync < 0 then
+                        -- Flip predicted
+                        local phase_boost = 5  -- More aggressive for moving
+                        correction = correction + (desync > 0 and phase_boost or -phase_boost)
+                        table.insert(details, "phase_flip")
+                    end
+                end
+                
+                -- 3D vector projection with weighted strength
+                if angle_difference > 120 then
+                    -- Weight based on velocity magnitude
+                    local vel_magnitude = math.sqrt(move_x*move_x + move_y*move_y)
+                    local weight = math.min(vel_magnitude / 250, 1.3)  -- Max 1.3x
+                    local boost = (angle_difference - 120) * 0.18 * weight
+                    correction = correction + (desync > 0 and -boost or boost)
+                    table.insert(details, string.format("3d_w%.1f", weight))
+                elseif angle_difference > 90 then
+                    local vel_magnitude = math.sqrt(move_x*move_x + move_y*move_y)
+                    local weight = math.min(vel_magnitude / 250, 1.2)
+                    local boost = (angle_difference - 90) * 0.12 * weight
+                    correction = correction + (desync > 0 and -boost or boost)
+                end
+                
+                -- Combined velocity and movement vector with cross-correlation
                 local vel_important = math.abs(vel_delta) > 85
                 local move_vec_important = math.abs(move_delta) > 70
                 
-                if vel_important or move_vec_important then
-                    -- Use average of both vectors for better accuracy
+                if vel_important and move_vec_important then
+                    -- Cross-correlation: check if signals agree
+                    local correlation_sign = (vel_delta * move_delta) > 0 and 1 or -1
                     local combined_angle = (vel_delta + move_delta) / 2
                     
+                    -- Weight by correlation (1.2x if agree, 0.8x if disagree)
+                    local corr_weight = 1.0 + (0.2 * correlation_sign)
+                    
                     if math.abs(combined_angle) > 110 then
-                        -- Backpedaling or heavy strafe
-                        local adjust = combined_angle > 0 and 8 or -8
+                        -- Strong movement with correlation weighting
+                        local adjust = (combined_angle > 0 and 8 or -8) * corr_weight
                         correction = correction + adjust
-                        table.insert(details, "backpedal")
+                        table.insert(details, string.format("vec_r%.1f", corr_weight))
                     elseif math.abs(combined_angle) > 85 then
-                        -- Moderate strafe
-                        local adjust = combined_angle > 0 and 5 or -5
+                        local adjust = (combined_angle > 0 and 5 or -5) * corr_weight
                         correction = correction + adjust
-                        table.insert(details, "strafe")
+                        table.insert(details, string.format("str_r%.1f", corr_weight))
+                    end
+                elseif vel_important then
+                    -- Only velocity important
+                    if math.abs(vel_delta) > 110 then
+                        correction = correction + (vel_delta > 0 and 7 or -7)
+                        table.insert(details, "vel_solo")
+                    end
+                elseif move_vec_important then
+                    -- Only movement important
+                    if math.abs(move_delta) > 95 then
+                        correction = correction + (move_delta > 0 and 6 or -6)
+                        table.insert(details, "mov_solo")
                     end
                 end
                 
@@ -929,6 +1059,10 @@ callbacks.add(e_callbacks.EVENT, function()
             jitter_detected = false,
             jitter_amplitude = 0,
             jitter_frequency = 0,
+            yaw_velocity = 0,
+            yaw_acceleration = 0,
+            jitter_phase = 0,
+            harmonic_period = 0,
             current_side = 0,
             last_side = 0,
             side_flips = 0,
@@ -954,21 +1088,21 @@ end, "round_start")
 
 -- Load message
 print("╔═══════════════════════════════════════════════╗")
-print("║  Perfect Resolver v6.4 - Delay AA Enhanced   ║")
+print("║  Perfect Resolver v6.5 - Advanced Math       ║")
 print("╠═══════════════════════════════════════════════╣")
-print("║  DELAY AA IMPROVEMENTS:                       ║")
-print("║  • Median interval (instead of EMA)           ║")
-print("║  • Confidence-based correction (up to +15%)   ║")
-print("║  • 2-tick ahead prediction (not 1)            ║")
-print("║  • Side flip prediction (>75% confidence)     ║")
-print("║  • 3D boost for delay (up to +10°)            ║")
-print("║  • Enhanced frozen state (0.82-0.92x)         ║")
+print("║  JITTER - HIGHER MATHEMATICS:                 ║")
+print("║  • Calculus: dy/dt & d²y/dt² (derivatives)    ║")
+print("║  • Harmonic: sin(ωt+φ) phase prediction       ║")
+print("║  • Cross-correlation: r(vel,move) weighting   ║")
+print("║  • Vector projection: ||v|| weighted          ║")
+print("║  • Acceleration boost: up to +10° (d²y/dt²)   ║")
+print("║  • Phase flip: predict from ω & φ             ║")
 print("║                                               ║")
-print("║  JITTER (v6.3):                               ║")
-print("║  • Desync-based (92-100%)                     ║")
-print("║  • Lean up to ±20°                            ║")
-print("║  • 3D boost +8°                               ║")
-print("║  • Sensitive detection (>25°)                 ║")
+print("║  DELAY AA (v6.4):                             ║")
+print("║  • Median interval (robust)                   ║")
+print("║  • Confidence (up to +15%)                    ║")
+print("║  • 2-tick prediction                          ║")
+print("║  • Side flip prediction                       ║")
 print("║                                               ║")
-print("║  NO ML, NO Brute - Pure Math                 ║")
+print("║  NO ML, NO Brute - Pure Higher Math          ║")
 print("╚═══════════════════════════════════════════════╝")
