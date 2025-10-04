@@ -1,7 +1,14 @@
 --[[
-    Perfect Jitter Resolver v6.0
+    Perfect Resolver v6.4 - Delay AA Enhanced
     Maximum detail and accuracy
     No ML, No brute force - just pure intelligent logic
+    
+    v6.4 Changes:
+    - Median interval calculation (more robust)
+    - Confidence-based corrections (+15% boost)
+    - 2-tick ahead prediction
+    - Side flip prediction for delay AA
+    - Enhanced frozen state correction
 ]]
 
 local ffi = require("ffi")
@@ -110,7 +117,10 @@ for i = 1, 65 do
         ticks_since_update = 0,
         delay_detected = false,
         delay_interval = 0,
-        frozen_ticks = 0
+        frozen_ticks = 0,
+        delay_history = {},
+        delay_confidence = 0,
+        last_delay_side = 0
     }
 end
 
@@ -273,18 +283,42 @@ local function resolve_player(player)
         local ticks_since_last_update = current_tick - data.last_yaw_update_tick
         
         if data.last_yaw_update_tick > 0 and ticks_since_last_update > 0 then
-            -- Update delay interval
-            if data.delay_interval == 0 then
-                data.delay_interval = ticks_since_last_update
+            -- Store in history for accurate interval calculation
+            table.insert(data.delay_history, ticks_since_last_update)
+            if #data.delay_history > 8 then
+                table.remove(data.delay_history, 1)
+            end
+            
+            -- Calculate median interval (more robust than EMA)
+            if #data.delay_history >= 3 then
+                local sorted = {}
+                for i, v in ipairs(data.delay_history) do
+                    sorted[i] = v
+                end
+                table.sort(sorted)
+                local median_idx = math.ceil(#sorted / 2)
+                data.delay_interval = sorted[median_idx]
+                
+                -- Confidence based on consistency
+                local consistency = 0
+                for _, v in ipairs(data.delay_history) do
+                    if math.abs(v - data.delay_interval) <= 1 then
+                        consistency = consistency + 1
+                    end
+                end
+                data.delay_confidence = consistency / #data.delay_history
             else
-                -- Smooth the interval (exponential moving average)
-                data.delay_interval = math.floor((data.delay_interval * 0.7) + (ticks_since_last_update * 0.3))
+                data.delay_interval = ticks_since_last_update
+                data.delay_confidence = 0.5
             end
             
             -- Detect delay pattern (updates every N ticks)
             if ticks_since_last_update >= 2 then
                 data.delay_detected = true
             end
+            
+            -- Track which side they went to
+            data.last_delay_side = desync > 0 and 1 or -1
         end
         
         data.last_real_yaw = eye_yaw
@@ -361,55 +395,119 @@ local function resolve_player(player)
         
         -- Predict next update
         local ticks_until_update = data.delay_interval - data.ticks_since_update
-        local update_imminent = ticks_until_update <= 1
+        local update_imminent = ticks_until_update <= 2  -- Predict 2 ticks ahead
+        local confidence_boost = 1 + (data.delay_confidence * 0.15)  -- Up to 15% boost
         
         if update_imminent and data.delay_interval > 0 then
-            -- About to update - use more aggressive prediction
+            -- About to update - AGGRESSIVE prediction
             if abs_desync > 35 then
                 -- High desync delay AA
+                local base_correction = math.min(abs_desync * 0.98, 60) * confidence_boost
+                
                 if is_standing then
-                    -- Standing delay - likely to flip or hold
-                    correction = desync > 0 and -60 or 60
+                    -- Standing delay - predict flip based on history
+                    correction = desync > 0 and -base_correction or base_correction
+                    
+                    -- If high confidence and they flip consistently, prepare for flip
+                    if data.delay_confidence > 0.75 and data.last_delay_side ~= 0 then
+                        if data.last_delay_side == (desync > 0 and 1 or -1) then
+                            -- They stayed same side - likely to flip NOW
+                            correction = -correction
+                            table.insert(details, "predict_flip")
+                        else
+                            table.insert(details, "predict_hold")
+                        end
+                    end
+                    
                     table.insert(details, "delay_stand")
                 else
                     -- Moving delay
-                    correction = desync > 0 and -58 or 58
+                    correction = desync > 0 and -base_correction or base_correction
                     
-                    -- Add velocity consideration
-                    if math.abs(vel_delta) > 100 then
-                        correction = correction + (vel_delta > 0 and 5 or -5)
+                    -- Velocity boost (more aggressive)
+                    if math.abs(vel_delta) > 110 then
+                        correction = correction + (vel_delta > 0 and 7 or -7)
+                        table.insert(details, "vel_boost")
+                    elseif math.abs(vel_delta) > 70 then
+                        correction = correction + (vel_delta > 0 and 4 or -4)
                     end
                     
                     table.insert(details, "delay_move")
                 end
                 
-                -- Lean is still important
-                if math.abs(lean) > 0.3 then
+                -- Lean (critical for delay AA)
+                if math.abs(lean) > 0.4 then
+                    correction = correction + (lean > 0 and 16 or -16)
+                    table.insert(details, "lean_high")
+                elseif math.abs(lean) > 0.25 then
                     correction = correction + (lean > 0 and 12 or -12)
+                    table.insert(details, "lean_med")
+                elseif math.abs(lean) > 0.1 then
+                    correction = correction + (lean > 0 and 8 or -8)
+                end
+                
+                -- 3D vector boost for delay AA
+                if angle_difference > 130 then
+                    local boost = math.min((angle_difference - 130) * 0.2, 10)
+                    correction = correction + (desync > 0 and -boost or boost)
+                    table.insert(details, "3d_boost")
                 end
             else
                 -- Medium/low desync delay
-                correction = desync > 0 and -52 or 52
+                correction = desync > 0 and -(abs_desync * 0.92) or (abs_desync * 0.92)
+                
+                if math.abs(lean) > 0.25 then
+                    correction = correction + (lean > 0 and 10 or -10)
+                end
             end
             
-            table.insert(details, string.format("update_in_%dt", ticks_until_update))
+            table.insert(details, string.format("update_%dt", ticks_until_update))
         else
-            -- Frozen state - resolve current position more conservatively
+            -- Frozen state - resolve with confidence weighting
             if abs_desync > 35 then
-                correction = desync > 0 and -(abs_desync * 0.85) or (abs_desync * 0.85)
-                table.insert(details, "frozen")
+                -- High confidence = more aggressive frozen correction
+                local frozen_mult = 0.82 + (data.delay_confidence * 0.10)  -- 0.82-0.92
+                correction = desync > 0 and -(abs_desync * frozen_mult) or (abs_desync * frozen_mult)
+                
+                -- Lean for frozen
+                if math.abs(lean) > 0.3 then
+                    correction = correction + (lean > 0 and 14 or -14)
+                    table.insert(details, "lean_frz")
+                elseif math.abs(lean) > 0.18 then
+                    correction = correction + (lean > 0 and 10 or -10)
+                end
+                
+                -- Feet yaw rate (important when frozen)
+                if math.abs(feet_yaw_rate) > 50 then
+                    correction = correction + (feet_yaw_rate > 0 and 8 or -8)
+                    table.insert(details, "feet_frz")
+                elseif math.abs(feet_yaw_rate) > 30 then
+                    correction = correction + (feet_yaw_rate > 0 and 5 or -5)
+                end
+                
+                table.insert(details, "frozen_hi")
             elseif abs_desync > 20 then
-                correction = desync > 0 and -35 or 35
+                correction = desync > 0 and -(abs_desync * 0.88) or (abs_desync * 0.88)
+                
+                if math.abs(lean) > 0.25 then
+                    correction = correction + (lean > 0 and 9 or -9)
+                end
+                
+                table.insert(details, "frozen_md")
             else
-                correction = desync > 0 and -25 or 25
+                correction = desync > 0 and -(abs_desync * 0.85) or (abs_desync * 0.85)
+                table.insert(details, "frozen_lo")
             end
             
-            table.insert(details, string.format("frozen_%dt", data.frozen_ticks))
+            table.insert(details, string.format("frz_%dt", data.frozen_ticks))
         end
         
-        -- Add delay interval info
+        -- Add delay interval and confidence info
         if data.delay_interval > 0 then
             table.insert(details, string.format("int_%dt", data.delay_interval))
+            if data.delay_confidence > 0.75 then
+                table.insert(details, string.format("conf_%.0f%%", data.delay_confidence * 100))
+            end
         end
         
     elseif is_jittering then
@@ -842,7 +940,10 @@ callbacks.add(e_callbacks.EVENT, function()
             ticks_since_update = 0,
             delay_detected = false,
             delay_interval = 0,
-            frozen_ticks = 0
+            frozen_ticks = 0,
+            delay_history = {},
+            delay_confidence = 0,
+            last_delay_side = 0
         }
     end
     
@@ -853,20 +954,21 @@ end, "round_start")
 
 -- Load message
 print("╔═══════════════════════════════════════════════╗")
-print("║  Perfect Resolver v6.3 - Optimized           ║")
+print("║  Perfect Resolver v6.4 - Delay AA Enhanced   ║")
 print("╠═══════════════════════════════════════════════╣")
-print("║  JITTER IMPROVEMENTS:                         ║")
-print("║  • Desync-based angles (92-100% accuracy)     ║")
-print("║  • Enhanced lean (up to ±20° for moving)      ║")
-print("║  • 3D position boost (up to +8°)              ║")
-print("║  • Amplitude-adaptive (54-60° range)          ║")
-print("║  • More sensitive detection (>25° vs >35°)    ║")
+print("║  DELAY AA IMPROVEMENTS:                       ║")
+print("║  • Median interval (instead of EMA)           ║")
+print("║  • Confidence-based correction (up to +15%)   ║")
+print("║  • 2-tick ahead prediction (not 1)            ║")
+print("║  • Side flip prediction (>75% confidence)     ║")
+print("║  • 3D boost for delay (up to +10°)            ║")
+print("║  • Enhanced frozen state (0.82-0.92x)         ║")
 print("║                                               ║")
-print("║  ALSO INCLUDES:                               ║")
-print("║  • Delay AA (tick-based)                      ║")
-print("║  • LBY timing                                 ║")
-print("║  • Vector fusion                              ║")
-print("║  • Feet rate prediction                       ║")
+print("║  JITTER (v6.3):                               ║")
+print("║  • Desync-based (92-100%)                     ║")
+print("║  • Lean up to ±20°                            ║")
+print("║  • 3D boost +8°                               ║")
+print("║  • Sensitive detection (>25°)                 ║")
 print("║                                               ║")
 print("║  NO ML, NO Brute - Pure Math                 ║")
 print("╚═══════════════════════════════════════════════╝")
