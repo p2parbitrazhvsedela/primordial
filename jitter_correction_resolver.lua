@@ -302,13 +302,13 @@ local function resolve_player(player, player_index)
         
         data.last_sim_time = current_sim_time
         
-        -- Get base yaw from eye angles
-        local eye_angles = player:get_eye_angles()
-        if not eye_angles then
+        -- Get base yaw from animstate
+        local animstate = safe_get_animstate(player)
+        if not animstate then
             return false
         end
         
-        local current_yaw = eye_angles.y
+        local current_yaw = animstate.flEyeYaw
         
         -- Analyze animation layers for correction
         local layer_correction = analyze_animlayers(player, player_index)
@@ -347,14 +347,26 @@ local function resolve_player(player, player_index)
             data.jitter_side = 0
         end
         
-        -- Apply resolved angle to player
-        player:set_resolver_angle(resolved_yaw)
+        -- Apply resolved angle to player using animstate
+        if animstate then
+            animstate.flGoalFeetYaw = resolved_yaw
+        end
         
         -- Logging
         if cfg_logs:get() then
+            local player_name = "Player"
+            local success_name, name_result = pcall(function()
+                return player:get_name()
+            end)
+            if success_name and name_result then
+                player_name = name_result
+            else
+                player_name = "ID:" .. tostring(player_index)
+            end
+            
             local log_msg = string.format(
-                "[Resolver] Player %s | Yaw: %.1f | Correction: %.1f | Jitter: %s | Consecutive: %d",
-                tostring(player:get_name() or player_index),
+                "[Resolver] %s | Yaw: %.1f | Corr: %.1f | Jitter: %s | Count: %d",
+                tostring(player_name),
                 tostring(current_yaw),
                 tostring(total_correction),
                 tostring(data.jitter_detected),
