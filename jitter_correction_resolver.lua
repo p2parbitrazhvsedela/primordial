@@ -6,7 +6,7 @@
 
 local ffi = require("ffi")
 
--- FFI Definitions for Animation Layers and AnimState
+-- FFI Definitions for Animation Layers
 ffi.cdef[[
     typedef struct {
         float m_flCycle;
@@ -16,30 +16,6 @@ ffi.cdef[[
         int m_nOrder;
         int m_nSequence;
     } C_AnimationLayer;
-    
-    typedef struct {
-        char    pad0[0x60];
-        void*   pEntity;
-        void*   pActiveWeapon;
-        void*   pLastActiveWeapon;
-        float   flLastUpdateTime;
-        int     iLastUpdateFrame;
-        float   flLastUpdateIncrement;
-        float   flEyeYaw;
-        float   flEyePitch;
-        float   flGoalFeetYaw;
-        float   flLastFeetYaw;
-        float   flMoveYaw;
-        float   flLastMoveYaw;
-        float   flLeanAmount;
-        char    pad1[0x4];
-        float   flFeetCycle;
-        float   flMoveWeight;
-        float   flMoveWeightSmoothed;
-        float   flDuckAmount;
-        float   flHitGroundCycle;
-        float   flRecrouchWeight;
-    } CCSGOPlayerAnimState;
 ]]
 
 -- Configuration UI using proper menu system
@@ -89,27 +65,24 @@ local function safe_get_animlayers(player)
     end
 end
 
--- Safe animstate access
-local function safe_get_animstate(player)
+-- Get eye yaw from prop (backup method)
+local function get_eye_yaw(player)
     if not player then
         return nil
     end
     
     local success, result = pcall(function()
-        local animstate_ptr = player:get_anim_state()
-        if not animstate_ptr or animstate_ptr == nil then
-            return nil
+        -- Try to get eye angles from prop
+        local angles = player:get_prop("m_angEyeAngles")
+        if angles then
+            return angles.y
         end
-        
-        return ffi.cast("CCSGOPlayerAnimState*", animstate_ptr)
+        return nil
     end)
     
     if success and result then
         return result
     else
-        if cfg_logs:get() then
-            print("[Resolver] AnimState Error (safe_get_animstate): " .. tostring(result))
-        end
         return nil
     end
 end
@@ -153,16 +126,6 @@ local function analyze_animlayers(player, player_index)
     
     local data = resolver_data[player_index]
     
-    -- Get animstate for additional data
-    local animstate = safe_get_animstate(player)
-    local feet_yaw_delta = 0
-    
-    if animstate then
-        local goal_feet_yaw = animstate.flGoalFeetYaw
-        local eye_yaw = animstate.flEyeYaw
-        feet_yaw_delta = math.abs(goal_feet_yaw - eye_yaw)
-    end
-    
     -- Store layer history for pattern detection
     table.insert(data.layer_history, {
         weight_3 = layer_3.m_flWeight,
@@ -171,8 +134,7 @@ local function analyze_animlayers(player, player_index)
         weight_12 = layer_12.m_flWeight,
         cycle_3 = layer_3.m_flCycle,
         cycle_11 = layer_11.m_flCycle,
-        cycle_12 = layer_12.m_flCycle,
-        feet_delta = feet_yaw_delta
+        cycle_12 = layer_12.m_flCycle
     })
     
     -- Keep only last 5 entries
@@ -230,12 +192,6 @@ local function analyze_animlayers(player, player_index)
                 data.jitter_detected = false
             end
         end
-    end
-    
-    -- Use feet yaw delta for additional correction
-    if feet_yaw_delta > 35 then
-        local feet_correction = (feet_yaw_delta - 35) * 0.5
-        correction = correction + (data.jitter_side * feet_correction)
     end
     
     return correction
@@ -302,13 +258,11 @@ local function resolve_player(player, player_index)
         
         data.last_sim_time = current_sim_time
         
-        -- Get base yaw from animstate
-        local animstate = safe_get_animstate(player)
-        if not animstate then
+        -- Get base yaw from eye angles prop
+        local current_yaw = get_eye_yaw(player)
+        if not current_yaw then
             return false
         end
-        
-        local current_yaw = animstate.flEyeYaw
         
         -- Analyze animation layers for correction
         local layer_correction = analyze_animlayers(player, player_index)
@@ -347,10 +301,8 @@ local function resolve_player(player, player_index)
             data.jitter_side = 0
         end
         
-        -- Apply resolved angle to player using animstate
-        if animstate then
-            animstate.flGoalFeetYaw = resolved_yaw
-        end
+        -- Store resolved angle for this player
+        data.resolved_yaw = resolved_yaw
         
         -- Logging
         if cfg_logs:get() then
