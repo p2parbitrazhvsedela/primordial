@@ -137,6 +137,44 @@ local function get_velocity_angle(vel_x, vel_y)
     return math.deg(math.atan2(vel_y, vel_x))
 end
 
+-- Calculate 3D vector angle
+local function vector_to_angle(vec_x, vec_y)
+    if vec_x == 0 and vec_y == 0 then return 0 end
+    local yaw = math.deg(math.atan2(vec_y, vec_x))
+    return normalize_angle(yaw)
+end
+
+-- Get player head position
+local function get_head_position(player)
+    local ok, result = pcall(function()
+        local origin = player:get_prop("m_vecOrigin")
+        if not origin then return nil end
+        
+        local view_offset = player:get_prop("m_vecViewOffset")
+        if not view_offset then
+            view_offset = {x = 0, y = 0, z = 64}  -- Default head height
+        end
+        
+        return {
+            x = origin.x + view_offset.x,
+            y = origin.y + view_offset.y,
+            z = origin.z + view_offset.z
+        }
+    end)
+    
+    return ok and result or nil
+end
+
+-- Calculate angle to position
+local function calc_angle_to_pos(from_pos, to_pos)
+    if not from_pos or not to_pos then return 0 end
+    
+    local delta_x = to_pos.x - from_pos.x
+    local delta_y = to_pos.y - from_pos.y
+    
+    return vector_to_angle(delta_x, delta_y)
+end
+
 -- Main resolver function
 local function resolve_player(player)
     if not player or player:is_dormant() then return end
@@ -169,6 +207,31 @@ local function resolve_player(player)
     -- Calculate velocity angle and delta
     local vel_angle = get_velocity_angle(vel_x, vel_y)
     local vel_delta = normalize_angle(eye_yaw - vel_angle)
+    
+    -- Get 3D position data
+    local enemy_head = get_head_position(player)
+    local local_player = entity_list.get_local_player()
+    local local_head = local_player and get_head_position(local_player) or nil
+    
+    -- Calculate real angle enemy should be looking at us
+    local real_angle_to_local = 0
+    local angle_difference = 0
+    if enemy_head and local_head then
+        real_angle_to_local = calc_angle_to_pos(enemy_head, local_head)
+        angle_difference = math.abs(normalize_angle(eye_yaw - real_angle_to_local))
+    end
+    
+    -- Origin position from animstate (more accurate)
+    local origin_x = animstate.m_vOriginX
+    local origin_y = animstate.m_vOriginY
+    local last_origin_x = animstate.m_vLastOriginX
+    local last_origin_y = animstate.m_vLastOriginY
+    
+    -- Movement vector from origin delta
+    local move_x = origin_x - last_origin_x
+    local move_y = origin_y - last_origin_y
+    local move_angle = get_velocity_angle(move_x, move_y)
+    local move_delta = normalize_angle(eye_yaw - move_angle)
     
     -- Store current tick data
     local current_tick = {
@@ -368,24 +431,54 @@ local function resolve_player(player)
                 else
                     -- Fresh LBY - resolve OPPOSITE side
                     
-                    -- Base angle depends on jitter amplitude
+                    -- Base angle depends on jitter amplitude (optimized for accuracy)
                     local base_angle = 58
-                    if max_yaw_change > 85 then
+                    if max_yaw_change > 90 then
+                        -- Extreme jitter
                         base_angle = 60
-                        table.insert(details, "heavy_jitter")
-                    elseif max_yaw_change > 65 then
+                        table.insert(details, "extreme_jitter")
+                    elseif max_yaw_change > 75 then
+                        -- Very heavy jitter (80° range common)
                         base_angle = 59
-                        table.insert(details, "strong_jitter")
-                    elseif max_yaw_change > 45 then
+                        table.insert(details, "vheavy_jitter")
+                    elseif max_yaw_change > 60 then
+                        -- Heavy jitter
                         base_angle = 58
+                        table.insert(details, "heavy_jitter")
+                    elseif max_yaw_change > 45 then
+                        -- Medium jitter
+                        base_angle = 57
                         table.insert(details, "medium_jitter")
-                    else
+                    elseif max_yaw_change > 30 then
+                        -- Light jitter
                         base_angle = 56
                         table.insert(details, "light_jitter")
+                    else
+                        -- Very light
+                        base_angle = 54
+                        table.insert(details, "vlight_jitter")
                     end
                     
                     -- Apply opposite direction
                     correction = desync > 0 and -base_angle or base_angle
+                    
+                    -- 3D vector analysis - check if enemy looking away from us
+                    if angle_difference > 140 then
+                        -- Enemy looking very far from us - likely aggressive fake
+                        correction = correction * 1.12
+                        table.insert(details, "fake_away")
+                    elseif angle_difference > 100 then
+                        -- Moderate fake angle
+                        correction = correction * 1.06
+                        table.insert(details, "angle_sus")
+                    end
+                    
+                    -- Movement vector consideration for micro-movements
+                    if math.abs(move_delta) > 60 and (math.abs(move_x) + math.abs(move_y)) > 0.5 then
+                        local move_adjust = move_delta > 0 and 5 or -5
+                        correction = correction + move_adjust
+                        table.insert(details, "move_vec")
+                    end
                     
                     -- Lean correction (very important for standing)
                     if math.abs(lean) > 0.4 then
@@ -439,31 +532,56 @@ local function resolve_player(player)
             if abs_desync > 38 then
                 -- High desync moving
                 
-                -- Base angle by jitter amplitude
+                -- Base angle by jitter amplitude (optimized)
                 local base_angle = 58
-                if max_yaw_change > 85 then
+                if max_yaw_change > 90 then
                     base_angle = 60
-                elseif max_yaw_change > 65 then
+                    table.insert(details, "extreme_move")
+                elseif max_yaw_change > 75 then
                     base_angle = 59
-                elseif max_yaw_change > 45 then
+                    table.insert(details, "vheavy_move")
+                elseif max_yaw_change > 60 then
                     base_angle = 58
-                else
+                    table.insert(details, "heavy_move")
+                elseif max_yaw_change > 45 then
+                    base_angle = 57
+                    table.insert(details, "med_move")
+                elseif max_yaw_change > 30 then
                     base_angle = 56
+                    table.insert(details, "light_move")
+                else
+                    base_angle = 54
                 end
                 
                 correction = desync > 0 and -base_angle or base_angle
                 
-                -- Velocity direction analysis
-                if math.abs(vel_delta) > 110 then
-                    -- Moving backwards or very sideways
-                    local vel_adjust = vel_delta > 0 and 6 or -6
-                    correction = correction + vel_adjust
-                    table.insert(details, "backpedal")
-                elseif math.abs(vel_delta) > 85 then
-                    -- Sideways movement
-                    local vel_adjust = vel_delta > 0 and 4 or -4
-                    correction = correction + vel_adjust
-                    table.insert(details, "strafe")
+                -- 3D position analysis for moving
+                if angle_difference > 120 then
+                    correction = correction * 1.10
+                    table.insert(details, "3d_fake")
+                elseif angle_difference > 90 then
+                    correction = correction * 1.05
+                end
+                
+                -- Combined velocity and movement vector analysis
+                local vel_important = math.abs(vel_delta) > 85
+                local move_vec_important = math.abs(move_delta) > 70
+                
+                if vel_important or move_vec_important then
+                    -- Use average of both vectors for better accuracy
+                    local combined_angle = (vel_delta + move_delta) / 2
+                    
+                    if math.abs(combined_angle) > 110 then
+                        -- Backpedaling or heavy strafe
+                        local adjust = combined_angle > 0 and 8 or -8
+                        correction = correction + adjust
+                        table.insert(details, "backpedal")
+                    elseif math.abs(combined_angle) > 85 then
+                        -- Moderate strafe
+                        local adjust = combined_angle > 0 and 5 or -5
+                        correction = correction + adjust
+                        table.insert(details, "strafe")
+                    end
                 end
                 
                 -- Feet yaw rate (predicts where body is rotating)
@@ -629,6 +747,11 @@ local function resolve_player(player)
             table.insert(info_parts, string.format("FR:%d", math.floor(feet_yaw_rate)))
         end
         
+        -- 3D angle difference
+        if angle_difference > 80 then
+            table.insert(info_parts, string.format("3D:%.0f°", angle_difference))
+        end
+        
         local info_str = ""
         if #info_parts > 0 then
             info_str = " | " .. table.concat(info_parts, " ")
@@ -695,11 +818,16 @@ callbacks.add(e_callbacks.EVENT, function()
 end, "round_start")
 
 -- Load message
-print("╔════════════════════════════════════════════╗")
-print("║  Perfect Resolver v6.1 - Ultimate Edition  ║")
-print("║  • Jitter anti-aim resolution              ║")
-print("║  • Delay anti-aim detection (tick-based)   ║")
-print("║  • LBY timing prediction                   ║")
-print("║  • Advanced animstate analysis             ║")
-print("║  No ML, No brute - Pure intelligence       ║")
-print("╚════════════════════════════════════════════╝")
+print("╔═══════════════════════════════════════════════╗")
+print("║  Perfect Resolver v6.2 - 3D Vector Edition   ║")
+print("╠═══════════════════════════════════════════════╣")
+print("║  ✓ Jitter anti-aim (6-tier amplitude)        ║")
+print("║  ✓ Delay anti-aim (tick-based detection)     ║")
+print("║  ✓ 3D vector position analysis                ║")
+print("║  ✓ Velocity + movement vector fusion          ║")
+print("║  ✓ LBY timing prediction                      ║")
+print("║  ✓ Feet yaw rate prediction                   ║")
+print("║  ✓ Lean micro-adjustments                     ║")
+print("║                                               ║")
+print("║  NO ML, NO Brute Force - Pure Math & Logic   ║")
+print("╚═══════════════════════════════════════════════╝")
