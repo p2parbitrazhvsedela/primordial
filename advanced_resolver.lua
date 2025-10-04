@@ -93,7 +93,10 @@ for i = 1, MAX_PLAYERS do
         consecutive_jitters = 0,
         miss_count = 0,
         brute_phase = 0,
-        last_update = 0
+        last_update = 0,
+        last_side = 0,
+        side_changes = 0,
+        predicted_side = 0
     }
 end
 
@@ -145,10 +148,19 @@ local function resolve_player(player)
     local on_ground = animstate.m_bOnGround
     local duck_amount = animstate.m_fDuckAmount
     local lean_amount = animstate.m_flLeanAmount
+    local feet_yaw_rate = animstate.m_flFeetYawRate or 0
+    local time_since_stopped = animstate.m_flTimeSinceStoppedMoving or 0
+    local time_since_started = animstate.m_flTimeSinceStartedMoving or 0
+    local velocity_x = animstate.m_vVelocityX or 0
+    local velocity_y = animstate.m_vVelocityY or 0
     
     -- Calculate desync
     local desync = normalize_angle(eye_yaw - goal_feet_yaw)
     local abs_desync = math.abs(desync)
+    
+    -- Calculate velocity angle
+    local velocity_angle = math.deg(math.atan2(velocity_y, velocity_x))
+    local velocity_delta = normalize_angle(eye_yaw - velocity_angle)
     
     -- Store history
     table.insert(data.history, {
@@ -161,6 +173,10 @@ local function resolve_player(player)
         on_ground = on_ground,
         duck = duck_amount,
         lean = lean_amount,
+        feet_rate = feet_yaw_rate,
+        time_stopped = time_since_stopped,
+        time_started = time_since_started,
+        vel_delta = velocity_delta,
         time = global_vars.cur_time()
     })
     
@@ -176,92 +192,139 @@ local function resolve_player(player)
     local prev = data.history[#data.history - 1]
     local prev2 = data.history[#data.history - 2]
     
-    -- Detect jitter patterns
+    -- Advanced jitter detection with pattern analysis
     local yaw_change = math.abs(curr.eye_yaw - prev.eye_yaw)
     local feet_change = math.abs(curr.goal_feet_yaw - prev.goal_feet_yaw)
     local side_flip = (curr.desync_signed * prev.desync_signed) < 0
+    local side_flip2 = (prev.desync_signed * prev2.desync_signed) < 0
     
-    local resolved_yaw = goal_feet_yaw -- Default: no change
+    -- Track side changes for pattern prediction
+    local current_side = desync > 0 and 1 or -1
+    if current_side ~= data.last_side and data.last_side ~= 0 then
+        data.side_changes = data.side_changes + 1
+    end
+    data.last_side = current_side
+    
+    local resolved_yaw = goal_feet_yaw
     local correction = 0
     
-    -- Jitter detection
-    local is_jittering = (yaw_change > 30 or feet_change > 35) or side_flip
+    -- Check if standing with LBY update prediction
+    local standing = speed_2d < 5
+    local lby_about_to_update = standing and time_since_stopped > 0.9 and time_since_stopped < 1.3
+    
+    -- Jitter detection with multiple indicators
+    local is_jittering = (yaw_change > 28 or feet_change > 30) or (side_flip and side_flip2)
     
     if is_jittering then
         data.jitter_detected = true
         data.consecutive_jitters = math.min(data.consecutive_jitters + 1, 20)
         
-        -- Brute force mode after 3 misses
+        -- Smart brute force after misses
         if data.miss_count > 2 then
-            data.brute_phase = (data.brute_phase + 1) % 3
-            
-            if data.brute_phase == 0 then
-                correction = 60
-            elseif data.brute_phase == 1 then
-                correction = -60
-            else
-                correction = 0
-            end
-            
+            -- Cycle through sides with center
+            local brute_angles = {58, -58, 45, -45, 0}
+            data.brute_phase = (data.brute_phase + 1) % #brute_angles
+            correction = brute_angles[data.brute_phase + 1]
             resolved_yaw = eye_yaw + correction
         else
-            -- Smart resolution based on animstate data
-            
-            -- Check if standing
-            local standing = speed_2d < 5
-            
+            -- Intelligent resolution
             if standing then
-                -- Standing jitter
+                -- Standing jitter with LBY timing
                 if abs_desync > 35 then
-                    -- High desync - resolve opposite
-                    correction = desync > 0 and -58 or 58
+                    if lby_about_to_update then
+                        -- LBY will update soon - resolve to current side
+                        correction = desync * 0.9
+                    else
+                        -- LBY fresh - resolve opposite with confidence
+                        correction = desync > 0 and -58 or 58
+                        
+                        -- Pattern prediction
+                        if data.side_changes > 8 then
+                            -- Heavy side switching
+                            local predicted = data.consecutive_jitters % 3
+                            if predicted == 0 then correction = 60
+                            elseif predicted == 1 then correction = -60
+                            else correction = 52 * current_side end
+                        end
+                    end
                 else
-                    -- Low desync - alternate
+                    -- Low desync standing
                     correction = data.consecutive_jitters % 2 == 0 and 50 or -50
                 end
             else
-                -- Moving jitter
+                -- Moving jitter with velocity consideration
                 if abs_desync > 35 then
-                    -- Resolve based on desync side with alternation
+                    -- High desync moving
                     local base_corr = desync > 0 and -56 or 56
                     
+                    -- Consider velocity direction
+                    if math.abs(curr.vel_delta) > 90 then
+                        -- Moving backwards/sideways - more predictable
+                        base_corr = base_corr * 1.08
+                    end
+                    
+                    -- Alternation for heavy jitter
                     if data.consecutive_jitters > 5 then
-                        -- Heavy jitter - alternate
                         if data.consecutive_jitters % 2 == 0 then
                             base_corr = -base_corr
                         end
                     end
                     
                     correction = base_corr
-                else
+                elseif abs_desync > 20 then
                     -- Medium desync
                     correction = data.consecutive_jitters % 2 == 0 and 52 or -52
+                else
+                    -- Low desync moving
+                    correction = data.consecutive_jitters % 2 == 0 and 48 or -48
                 end
             end
             
-            -- Use lean amount for micro-adjustment
-            if math.abs(lean_amount) > 0.3 then
-                local lean_corr = lean_amount > 0 and 8 or -8
+            -- Lean amount micro-adjustment (more aggressive)
+            if math.abs(lean_amount) > 0.25 then
+                local lean_corr = lean_amount > 0 and 10 or -10
                 correction = correction + lean_corr
             end
             
-            -- Apply correction
+            -- Feet yaw rate adjustment (predicts where feet are going)
+            if math.abs(feet_yaw_rate) > 30 then
+                local rate_corr = feet_yaw_rate > 0 and 5 or -5
+                correction = correction + rate_corr
+            end
+            
+            -- Duck amount boost
+            if duck_amount > 0.5 then
+                correction = correction * 1.03
+            end
+            
             resolved_yaw = eye_yaw + correction
         end
     else
-        -- No jitter - decay counter
+        -- No jitter detected
         data.consecutive_jitters = math.max(data.consecutive_jitters - 1, 0)
         if data.consecutive_jitters == 0 then
             data.jitter_detected = false
             data.miss_count = 0
+            data.side_changes = 0
         end
         
-        -- Soft correction based on desync
+        -- Soft correction based on state
         if abs_desync > 35 then
-            correction = desync > 0 and -(abs_desync * 0.8) or (abs_desync * 0.8)
+            if standing and lby_about_to_update then
+                -- Predictive correction before LBY update
+                correction = desync * 0.95
+            else
+                -- Standard opposite correction
+                correction = desync > 0 and -(abs_desync * 0.82) or (abs_desync * 0.82)
+            end
             resolved_yaw = eye_yaw + correction
-        elseif abs_desync > 15 then
-            correction = desync > 0 and -25 or 25
+        elseif abs_desync > 18 then
+            -- Medium desync soft correction
+            correction = desync > 0 and -28 or 28
+            resolved_yaw = eye_yaw + correction
+        elseif abs_desync > 8 then
+            -- Low desync micro-correction
+            correction = desync > 0 and -15 or 15
             resolved_yaw = eye_yaw + correction
         end
     end
@@ -283,24 +346,42 @@ local function resolve_player(player)
         end
         
         local mode = "SOFT"
+        local mode_detail = ""
+        
         if data.jitter_detected then
             if data.miss_count > 2 then
-                mode = "BRUTE"
+                mode = "BRUTE#" .. tostring(data.brute_phase)
             else
                 mode = "JITTER"
+                if standing then
+                    mode_detail = lby_about_to_update and " LBY↑" or " STAND"
+                else
+                    mode_detail = " MOVE"
+                end
+            end
+        else
+            if standing and lby_about_to_update then
+                mode_detail = " LBY↑"
             end
         end
         
+        -- Add side change indicator
+        local pattern_info = ""
+        if data.side_changes > 5 then
+            pattern_info = string.format(" | SC:%d", data.side_changes)
+        end
+        
         local log_msg = string.format(
-            "[Resolver] %s | Eye:%.1f Goal:%.1f→%.1f | Δ%d° | Corr:%.1f | %s | M:%d",
+            "[Resolver] %s | %.1f→%.1f | Δ%d° | Corr:%.1f | %s%s | M:%d%s",
             tostring(player_name),
             tostring(eye_yaw),
-            tostring(goal_feet_yaw),
             tostring(resolved_yaw),
             tostring(math.floor(abs_desync)),
-            tostring(correction),
+            tostring(math.floor(correction)),
             mode,
-            tostring(data.miss_count)
+            mode_detail,
+            tostring(data.miss_count),
+            pattern_info
         )
         print(log_msg)
     end
@@ -361,7 +442,10 @@ local function on_round_start()
             consecutive_jitters = 0,
             miss_count = 0,
             brute_phase = 0,
-            last_update = 0
+            last_update = 0,
+            last_side = 0,
+            side_changes = 0,
+            predicted_side = 0
         }
     end
 end
@@ -381,8 +465,13 @@ callbacks.add(e_callbacks.EVENT, on_round_start, "round_start")
 callbacks.add(e_callbacks.SHUTDOWN, on_shutdown)
 
 -- Load message
-print("[Resolver] Advanced Resolver v3.0 loaded")
-print("[Resolver] Features: FFI animstate, smart jitter detection, adaptive brute")
+print("[Resolver] Advanced Resolver v3.1 loaded")
+print("[Resolver] Features:")
+print("  • FFI direct animstate access")
+print("  • LBY update prediction")
+print("  • Pattern-based side prediction")
+print("  • Velocity & lean micro-adjustments")
+print("  • Smart adaptive brute force")
 if cfg_logs:get() then
     print("[Resolver] Debug logs enabled")
 end
