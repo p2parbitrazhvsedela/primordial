@@ -83,7 +83,7 @@ local function safe_get_animlayers(player)
         return result
     else
         if cfg_logs:get() then
-            print("[Resolver] FFI Error at line " .. tostring(debug.getinfo(1).currentline) .. ": " .. tostring(result))
+            print("[Resolver] FFI Error (safe_get_animlayers): " .. tostring(result))
         end
         return nil
     end
@@ -108,7 +108,7 @@ local function safe_get_animstate(player)
         return result
     else
         if cfg_logs:get() then
-            print("[Resolver] AnimState Error at line " .. tostring(debug.getinfo(1).currentline) .. ": " .. tostring(result))
+            print("[Resolver] AnimState Error (safe_get_animstate): " .. tostring(result))
         end
         return nil
     end
@@ -128,7 +128,7 @@ local function get_layer(layers, index)
         return result
     else
         if cfg_logs:get() then
-            print("[Resolver] Layer access error at line " .. tostring(debug.getinfo(1).currentline) .. ": " .. tostring(result))
+            print("[Resolver] Layer access error (get_layer): " .. tostring(result))
         end
         return nil
     end
@@ -367,7 +367,7 @@ local function resolve_player(player, player_index)
     end)
     
     if not success and cfg_logs:get() then
-        print("[Resolver] Error resolving player at line " .. tostring(debug.getinfo(1).currentline) .. ": " .. tostring(result))
+        print("[Resolver] Error resolving player (resolve_player): " .. tostring(result))
     end
 end
 
@@ -400,7 +400,7 @@ local function on_setup_command(cmd)
         end)
         
         if not success and cfg_logs:get() then
-            print("[Resolver] Error at line " .. tostring(debug.getinfo(1).currentline) .. ": " .. tostring(error_msg))
+            print("[Resolver] Error in main loop (on_setup_command): " .. tostring(error_msg))
         end
     end
 end
