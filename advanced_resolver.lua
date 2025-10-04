@@ -485,6 +485,47 @@ local function on_net_update()
     end
 end
 
+-- Handle hits for learning
+local function on_aimbot_hit(hit)
+    if not cfg_resolver:get() then return end
+    
+    local player_index = hit.player:get_index()
+    if not player_index then return end
+    
+    local data = resolver_data[player_index]
+    if not data then return end
+    
+    data.hit_count = data.hit_count + 1
+    data.correction_streak = data.correction_streak + 1
+    
+    -- Store successful correction
+    if data.last_correction ~= 0 then
+        table.insert(data.successful_corrections, data.last_correction)
+        
+        -- Keep only last 5 successful corrections
+        if #data.successful_corrections > 5 then
+            table.remove(data.successful_corrections, 1)
+        end
+        
+        -- Update best correction if we have a streak
+        if data.correction_streak > 2 then
+            data.best_correction = data.last_correction
+        end
+    end
+    
+    -- Reset miss count on hit
+    if data.miss_count > 0 then
+        data.miss_count = math.max(data.miss_count - 1, 0)
+    end
+    
+    if cfg_logs:get() then
+        print(string.format("[Resolver] ✓ HIT player %d | Corr: %d | Streak: %d", 
+            tostring(player_index), 
+            tostring(data.last_correction),
+            tostring(data.correction_streak)))
+    end
+end
+
 -- Handle misses
 local function on_aimbot_miss(miss)
     if not cfg_resolver:get() then return end
@@ -495,11 +536,18 @@ local function on_aimbot_miss(miss)
     local data = resolver_data[player_index]
     if not data then return end
     
-    data.miss_count = math.min(data.miss_count + 1, 5)
+    data.miss_count = math.min(data.miss_count + 1, 8)
+    data.correction_streak = 0  -- Reset streak on miss
+    
+    -- Reset best correction after multiple misses
+    if data.miss_count > 3 then
+        data.best_correction = 0
+    end
     
     if cfg_logs:get() then
-        print(string.format("[Resolver] Miss on player %d (Total: %d)", 
-            tostring(player_index), 
+        print(string.format("[Resolver] ✗ MISS player %d | Last corr: %d | Total miss: %d", 
+            tostring(player_index),
+            tostring(data.last_correction),
             tostring(data.miss_count)))
     end
 end
