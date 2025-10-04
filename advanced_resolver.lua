@@ -92,16 +92,10 @@ for i = 1, MAX_PLAYERS do
         jitter_detected = false,
         consecutive_jitters = 0,
         miss_count = 0,
-        hit_count = 0,
         brute_phase = 0,
         last_update = 0,
         last_side = 0,
-        side_changes = 0,
-        predicted_side = 0,
-        successful_corrections = {},
-        last_correction = 0,
-        correction_streak = 0,
-        best_correction = 0
+        side_changes = 0
     }
 end
 
