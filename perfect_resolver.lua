@@ -1,29 +1,35 @@
 --[[
-    Perfect Resolver v6.6 - Ultra Aggressive Jitter
+    Perfect Resolver v6.7 - Fakelag & Lagcomp
     Maximum detail and accuracy
     No ML, No brute force - just pure higher mathematics
     
-    v6.6 Changes (Ultra Jitter):
+    v6.7 Changes (Fakelag/Lagcomp):
+    - Choke detection via simulation time deltas
+    - Fakelag detection (choke >= 2 or avg > 1.5)
+    - Breaklag detection (choke >= 4, ultra aggressive)
+    - Velocity extrapolation from position deltas
+    - Linear prediction: v = Δpos / Δt
+    - Choke multiplier: up to 1.30x (+5% per tick)
+    - Velocity extrapolation boost: up to +12°
+    - EMA average choke tracking
+    
+    v6.6 (Ultra Jitter):
     - Jitter intensity metric (0-1 scale, multi-factor)
     - Adaptive multipliers: up to 1.10x base (moving) + 18% intensity
     - Enhanced lean: up to ±22° for moving, ±20° for standing
     - Feet cycle boost: ±3-4° at extremes (0.75/0.25)
     - Adaptive clamp: 72° for high intensity (>0.8)
-    - Consecutive high velocity tracking
-    - More aggressive base angles (1.02x desync for heavy)
     
     v6.5 (Jitter Math):
     - Derivatives: yaw velocity (dy/dt) & acceleration (d²y/dt²)
     - Harmonic analysis: phase angle & oscillation period
     - Phase prediction: sin(ωt + φ) wave modeling
     - Cross-correlation: velocity × movement agreement
-    - Vector projection: weighted by magnitude & direction
     
     v6.4 (Delay AA):
     - Median interval calculation (more robust)
     - Confidence-based corrections (+15% boost)
     - 2-tick ahead prediction
-    - Side flip prediction for delay AA
 ]]
 
 local ffi = require("ffi")
@@ -143,7 +149,17 @@ for i = 1, 65 do
         frozen_ticks = 0,
         delay_history = {},
         delay_confidence = 0,
-        last_delay_side = 0
+        last_delay_side = 0,
+        
+        -- Fakelag / Lagcomp tracking
+        last_simulation_time = 0,
+        choke_amount = 0,
+        avg_choke = 0,
+        fakelag_detected = false,
+        breaklag_detected = false,
+        velocity_history = {},
+        last_origin = nil,
+        extrapolated_yaw = 0
     }
 end
 
@@ -293,9 +309,76 @@ local function resolve_player(player)
     local prev = data.history[#data.history - 1]
     local prev2 = data.history[#data.history - 2]
     
-    -- ===== DELAY ANTI-AIM DETECTION =====
+    -- ===== FAKELAG / LAGCOMP DETECTION =====
     
     local current_tick = global_vars.tick_count()
+    local simulation_time = player:get_prop("m_flSimulationTime")
+    
+    -- Calculate choke (missed ticks)
+    if data.last_simulation_time > 0 and simulation_time > data.last_simulation_time then
+        local sim_delta = simulation_time - data.last_simulation_time
+        local tick_interval = global_vars.interval_per_tick()
+        local ticks_elapsed = math.floor(sim_delta / tick_interval + 0.5)
+        
+        -- Choke = ticks elapsed - 1 (normal is 1 tick per update)
+        data.choke_amount = math.max(0, ticks_elapsed - 1)
+        
+        -- Update average choke with EMA
+        if data.avg_choke == 0 then
+            data.avg_choke = data.choke_amount
+        else
+            data.avg_choke = (data.avg_choke * 0.8) + (data.choke_amount * 0.2)
+        end
+        
+        -- Fakelag detection (consistent choking)
+        if data.choke_amount >= 2 or data.avg_choke > 1.5 then
+            data.fakelag_detected = true
+        else
+            data.fakelag_detected = false
+        end
+        
+        -- Breaklag detection (sudden release after choking)
+        if data.choke_amount >= 4 then
+            data.breaklag_detected = true
+        else
+            data.breaklag_detected = false
+        end
+    end
+    
+    data.last_simulation_time = simulation_time
+    
+    -- Velocity-based extrapolation for fakelag
+    local origin = player:get_prop("m_vecOrigin")
+    if origin and data.last_origin then
+        local velocity_x = (origin.x - data.last_origin.x) / (data.choke_amount + 1)
+        local velocity_y = (origin.y - data.last_origin.y) / (data.choke_amount + 1)
+        
+        -- Store velocity history
+        table.insert(data.velocity_history, {x = velocity_x, y = velocity_y})
+        if #data.velocity_history > 5 then
+            table.remove(data.velocity_history, 1)
+        end
+        
+        -- Calculate average velocity for prediction
+        if #data.velocity_history >= 2 then
+            local avg_vel_x = 0
+            local avg_vel_y = 0
+            for _, vel in ipairs(data.velocity_history) do
+                avg_vel_x = avg_vel_x + vel.x
+                avg_vel_y = avg_vel_y + vel.y
+            end
+            avg_vel_x = avg_vel_x / #data.velocity_history
+            avg_vel_y = avg_vel_y / #data.velocity_history
+            
+            -- Extrapolate yaw based on velocity direction
+            if math.abs(avg_vel_x) > 0.5 or math.abs(avg_vel_y) > 0.5 then
+                data.extrapolated_yaw = math.deg(math.atan2(avg_vel_y, avg_vel_x))
+            end
+        end
+    end
+    data.last_origin = origin
+    
+    -- ===== DELAY ANTI-AIM DETECTION =====
     
     -- Detect if yaw actually updated this tick
     local yaw_delta_from_last = math.abs(eye_yaw - data.last_real_yaw)
@@ -467,8 +550,104 @@ local function resolve_player(player)
     local mode = "IDLE"
     local details = {}
     
+    -- ===== FAKELAG / LAGCOMP HANDLING =====
+    if data.fakelag_detected then
+        mode = "FAKELAG"
+        
+        -- Choke-based correction multiplier
+        local choke_mult = 1.0 + (data.choke_amount * 0.05)  -- +5% per choked tick
+        choke_mult = math.min(choke_mult, 1.30)  -- Max 1.3x
+        
+        if data.breaklag_detected then
+            -- Breaklag (4+ choked ticks) - VERY aggressive
+            mode = "BREAKLAG"
+            
+            if abs_desync > 35 then
+                -- High desync with breaklag
+                local base = math.min(abs_desync * 1.05, 60)  -- More aggressive
+                correction = (desync > 0 and -base or base) * choke_mult
+                
+                -- Velocity extrapolation correction
+                if data.extrapolated_yaw ~= 0 then
+                    local extrap_delta = normalize_angle(data.extrapolated_yaw - eye_yaw)
+                    if math.abs(extrap_delta) > 45 then
+                        -- Velocity direction strongly disagrees with yaw
+                        local vel_boost = math.min(math.abs(extrap_delta) * 0.15, 12)
+                        correction = correction + (extrap_delta > 0 and vel_boost or -vel_boost)
+                        table.insert(details, string.format("vel_extrap_%.0f", vel_boost))
+                    end
+                end
+                
+                -- Lean (critical for breaklag)
+                if math.abs(lean) > 0.35 then
+                    correction = correction + (lean > 0 and 18 or -18)
+                    table.insert(details, "lean_brk")
+                elseif math.abs(lean) > 0.2 then
+                    correction = correction + (lean > 0 and 12 or -12)
+                end
+                
+                table.insert(details, string.format("choke_%d", data.choke_amount))
+            else
+                -- Medium/low desync breaklag
+                correction = (desync > 0 and -(abs_desync * 0.95) or (abs_desync * 0.95)) * choke_mult
+            end
+            
+            table.insert(details, string.format("brk_x%.2f", choke_mult))
+            
+        else
+            -- Regular fakelag (2-3 choked ticks)
+            
+            if abs_desync > 35 then
+                -- High desync fakelag
+                local base = math.min(abs_desync * 1.00, 60)
+                correction = (desync > 0 and -base or base) * choke_mult
+                
+                -- Velocity consideration
+                if data.extrapolated_yaw ~= 0 then
+                    local extrap_delta = normalize_angle(data.extrapolated_yaw - eye_yaw)
+                    if math.abs(extrap_delta) > 60 then
+                        local vel_boost = math.min(math.abs(extrap_delta) * 0.12, 8)
+                        correction = correction + (extrap_delta > 0 and vel_boost or -vel_boost)
+                        table.insert(details, "vel_adj")
+                    end
+                end
+                
+                -- Lean
+                if math.abs(lean) > 0.3 then
+                    correction = correction + (lean > 0 and 15 or -15)
+                    table.insert(details, "lean_fl")
+                elseif math.abs(lean) > 0.18 then
+                    correction = correction + (lean > 0 and 10 or -10)
+                end
+                
+                -- Feet yaw rate (important for fakelag)
+                if math.abs(feet_yaw_rate) > 50 then
+                    correction = correction + (feet_yaw_rate > 0 and 8 or -8)
+                    table.insert(details, "feet_fl")
+                elseif math.abs(feet_yaw_rate) > 30 then
+                    correction = correction + (feet_yaw_rate > 0 and 5 or -5)
+                end
+                
+                table.insert(details, string.format("choke_%d", data.choke_amount))
+            else
+                -- Medium/low desync fakelag
+                correction = (desync > 0 and -(abs_desync * 0.92) or (abs_desync * 0.92)) * choke_mult
+                
+                if math.abs(lean) > 0.25 then
+                    correction = correction + (lean > 0 and 9 or -9)
+                end
+            end
+            
+            table.insert(details, string.format("fl_x%.2f", choke_mult))
+        end
+        
+        -- Average choke info
+        if data.avg_choke > 1.5 then
+            table.insert(details, string.format("avg_%.1ft", data.avg_choke))
+        end
+        
     -- ===== DELAY ANTI-AIM HANDLING =====
-    if data.delay_detected and not is_jittering then
+    elseif data.delay_detected and not is_jittering then
         mode = "DELAY"
         
         -- Predict next update
@@ -589,7 +768,13 @@ local function resolve_player(player)
         end
         
     elseif is_jittering then
-        mode = "JITTER"
+        -- Check if jitter + fakelag combo
+        if data.choke_amount >= 1 then
+            mode = "JITTER+FL"
+            table.insert(details, string.format("choke_%d", data.choke_amount))
+        else
+            mode = "JITTER"
+        end
         
         -- ===== STANDING JITTER =====
         if is_standing then
@@ -647,6 +832,13 @@ local function resolve_player(player)
                         table.insert(details, string.format("int_%.0f%%", data.jitter_intensity * 100))
                     end
                     
+                    -- Fakelag combo boost
+                    if data.choke_amount >= 1 then
+                        local fl_boost = 1.0 + (data.choke_amount * 0.03)  -- +3% per choke
+                        correction = correction * fl_boost
+                        table.insert(details, string.format("fl_x%.2f", fl_boost))
+                    end
+                    
                     -- ===== ADVANCED MATH CORRECTIONS =====
                     
                     -- Acceleration-based modifier (higher acceleration = more aggressive)
@@ -700,6 +892,16 @@ local function resolve_player(player)
                         local move_adjust = move_delta > 0 and 6 or -6
                         correction = correction + move_adjust
                         table.insert(details, "move_vec")
+                    end
+                    
+                    -- Extrapolated velocity correction (if fakelag present)
+                    if data.extrapolated_yaw ~= 0 and data.choke_amount >= 1 then
+                        local extrap_delta = normalize_angle(data.extrapolated_yaw - eye_yaw)
+                        if math.abs(extrap_delta) > 70 then
+                            local vel_correction = math.min(math.abs(extrap_delta) * 0.10, 8)
+                            correction = correction + (extrap_delta > 0 and vel_correction or -vel_correction)
+                            table.insert(details, "vel_ex")
+                        end
                     end
                     
                     -- Lean correction (CRITICAL for standing jitter) - ENHANCED
@@ -817,6 +1019,13 @@ local function resolve_player(player)
                 
                 if data.jitter_intensity > 0.7 then
                     table.insert(details, string.format("int_%.0f%%", data.jitter_intensity * 100))
+                end
+                
+                -- Fakelag combo boost (moving)
+                if data.choke_amount >= 1 then
+                    local fl_boost = 1.0 + (data.choke_amount * 0.04)  -- +4% per choke (more for moving)
+                    correction = correction * fl_boost
+                    table.insert(details, string.format("fl_x%.2f", fl_boost))
                 end
                 
                 -- ===== ADVANCED MATH FOR MOVING JITTER =====
@@ -949,6 +1158,16 @@ local function resolve_player(player)
                     table.insert(details, "feet_cyc")
                 end
                 
+                -- Extrapolated velocity correction (moving with fakelag)
+                if data.extrapolated_yaw ~= 0 and data.choke_amount >= 1 then
+                    local extrap_delta = normalize_angle(data.extrapolated_yaw - eye_yaw)
+                    if math.abs(extrap_delta) > 60 then
+                        local vel_correction = math.min(math.abs(extrap_delta) * 0.12, 10)
+                        correction = correction + (extrap_delta > 0 and vel_correction or -vel_correction)
+                        table.insert(details, "vel_ex")
+                    end
+                end
+                
             elseif abs_desync > 25 then
                 -- Medium desync moving
                 correction = desync > 0 and -(abs_desync * 0.95) or (abs_desync * 0.95)
@@ -1078,8 +1297,23 @@ local function resolve_player(player)
         -- Additional info
         local info_parts = {}
         
+        -- Fakelag info (highest priority)
+        if data.fakelag_detected then
+            if data.breaklag_detected then
+                table.insert(info_parts, string.format("BREAKLAG:%dt", data.choke_amount))
+            else
+                table.insert(info_parts, string.format("FAKELAG:%dt", data.choke_amount))
+            end
+            if data.avg_choke > 1.5 then
+                table.insert(info_parts, string.format("avg:%.1f", data.avg_choke))
+            end
+            if data.extrapolated_yaw ~= 0 then
+                table.insert(info_parts, string.format("extrap:%.0f°", data.extrapolated_yaw))
+            end
+        end
+        
         -- Delay info (priority)
-        if data.delay_detected then
+        if data.delay_detected and not data.fakelag_detected then
             table.insert(info_parts, string.format("DELAY:%dt", data.delay_interval))
             if data.frozen_ticks > 0 then
                 table.insert(info_parts, string.format("Frozen:%dt", data.frozen_ticks))
@@ -1179,7 +1413,15 @@ callbacks.add(e_callbacks.EVENT, function()
             frozen_ticks = 0,
             delay_history = {},
             delay_confidence = 0,
-            last_delay_side = 0
+            last_delay_side = 0,
+            last_simulation_time = 0,
+            choke_amount = 0,
+            avg_choke = 0,
+            fakelag_detected = false,
+            breaklag_detected = false,
+            velocity_history = {},
+            last_origin = nil,
+            extrapolated_yaw = 0
         }
     end
     
@@ -1190,21 +1432,20 @@ end, "round_start")
 
 -- Load message
 print("╔═══════════════════════════════════════════════╗")
-print("║  Perfect Resolver v6.6 - ULTRA AGGRESSIVE    ║")
+print("║  Perfect Resolver v6.7 - Fakelag & Lagcomp  ║")
 print("╠═══════════════════════════════════════════════╣")
-print("║  JITTER v6.6 - ULTRA MODE:                    ║")
-print("║  • Intensity metric: 0-1 (5 factors)          ║")
-print("║  • Adaptive multipliers: 1.10x + 18% boost    ║")
-print("║  • Lean: ±22° moving, ±20° standing           ║")
-print("║  • Feet cycle: ±4° at extremes                ║")
-print("║  • Adaptive clamp: 72° (high intensity)       ║")
-print("║  • Base: 1.02x desync (ultra aggressive)      ║")
+print("║  FAKELAG v6.7 - NEW:                          ║")
+print("║  • Choke detection: Δsim_time analysis        ║")
+print("║  • Fakelag: choke ≥2 or avg >1.5t             ║")
+print("║  • Breaklag: choke ≥4 (ultra aggressive)      ║")
+print("║  • Velocity extrapolation: v = Δpos/Δt        ║")
+print("║  • Choke multiplier: 1.30x max (+5%/tick)     ║")
+print("║  • Velocity boost: up to +12° deviation       ║")
+print("║  • EMA avg choke: 80% old + 20% new           ║")
 print("║                                               ║")
-print("║  v6.5 MATH:                                   ║")
-print("║  • dy/dt, d²y/dt² | sin(ωt+φ) | r(v,m)        ║")
+print("║  JITTER v6.6: Intensity | 1.10x + 18% | ±22° ║")
+print("║  MATH v6.5: dy/dt, d²y/dt² | sin(ωt+φ)       ║")
+print("║  DELAY v6.4: Median | Confidence | 2t pred   ║")
 print("║                                               ║")
-print("║  DELAY AA v6.4:                               ║")
-print("║  • Median | Confidence | 2-tick predict       ║")
-print("║                                               ║")
-print("║  NO ML, NO Brute - Pure Math + Aggression    ║")
+print("║  NO ML, NO Brute - Pure Math & Physics       ║")
 print("╚═══════════════════════════════════════════════╝")
