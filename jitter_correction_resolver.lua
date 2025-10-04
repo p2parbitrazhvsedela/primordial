@@ -281,21 +281,77 @@ local function analyze_jitter(player, player_index)
             table.remove(data.layer_history, 1)
         end
         
-        -- Jitter detection without LBY
-        if #data.layer_history >= 3 then
+        -- Enhanced jitter detection without LBY
+        if #data.layer_history >= 4 then
             local curr_hist = data.layer_history[#data.layer_history]
             local prev_hist = data.layer_history[#data.layer_history - 1]
-            local yaw_change_noLBY = math.abs(curr_hist.yaw - prev_hist.yaw)
+            local prev2_hist = data.layer_history[#data.layer_history - 2]
+            local prev3_hist = data.layer_history[#data.layer_history - 3]
             
-            if yaw_change_noLBY > 30 then
+            local yaw_change = math.abs(curr_hist.yaw - prev_hist.yaw)
+            local yaw_direction = normalize_angle(curr_hist.yaw - prev_hist.yaw)
+            
+            -- Calculate average jitter amplitude for adaptive correction
+            local avg_change = (yaw_change + math.abs(prev_hist.yaw - prev2_hist.yaw) + 
+                               math.abs(prev2_hist.yaw - prev3_hist.yaw)) / 3
+            
+            -- Detect jitter pattern
+            if yaw_change > 25 then
                 data.jitter_detected = true
-                data.consecutive_jitters = math.min(data.consecutive_jitters + 1, 15)
+                data.consecutive_jitters = math.min(data.consecutive_jitters + 1, 20)
                 
-                local corr = data.consecutive_jitters % 2 == 0 and 58 or -58
-                if data.consecutive_jitters > 6 then
-                    corr = corr * 1.1
+                local corr = 0
+                
+                -- Adaptive correction based on jitter amplitude
+                if avg_change > 70 then
+                    -- Heavy jitter (80°+)
+                    local phase = data.consecutive_jitters % 3
+                    if phase == 0 then
+                        corr = yaw_direction > 0 and 60 or -60
+                    elseif phase == 1 then
+                        corr = yaw_direction > 0 and -58 or 58
+                    else
+                        corr = yaw_direction > 0 and 52 or -52
+                    end
+                elseif avg_change > 40 then
+                    -- Medium jitter (40-70°)
+                    corr = data.consecutive_jitters % 2 == 0 and 58 or -58
+                    
+                    -- Add smart prediction
+                    if data.consecutive_jitters > 4 then
+                        corr = yaw_direction > 0 and -56 or 56
+                    end
+                else
+                    -- Light jitter (25-40°)
+                    corr = data.consecutive_jitters % 2 == 0 and 50 or -50
                 end
+                
+                -- Brute force override if too many misses
+                if data.miss_count > 2 then
+                    local brute = data.miss_count % 3
+                    if brute == 0 then corr = 60
+                    elseif brute == 1 then corr = -60
+                    else corr = 0 end
+                end
+                
+                -- Standing boost
+                if curr_hist.standing then
+                    corr = corr * 1.05
+                end
+                
                 return math.floor(corr)
+            else
+                -- No jitter, decay counter
+                data.consecutive_jitters = math.max(data.consecutive_jitters - 1, 0)
+                if data.consecutive_jitters == 0 then
+                    data.jitter_detected = false
+                    data.miss_count = 0
+                end
+                
+                -- Micro-correction for small movements
+                if yaw_change > 10 and yaw_change < 25 then
+                    return yaw_direction > 0 and -25 or 25
+                end
             end
         end
         
@@ -589,14 +645,26 @@ local function resolve_player(player, player_index)
                 mode_str = "FALLBACK"
             end
             
+            -- Calculate jitter info
+            local jitter_info = ""
+            if data.jitter_detected and #data.layer_history >= 3 then
+                local recent_changes = 0
+                for i = math.max(1, #data.layer_history - 2), #data.layer_history - 1 do
+                    recent_changes = recent_changes + math.abs(data.layer_history[i+1].yaw - data.layer_history[i].yaw)
+                end
+                local avg_jitter = math.floor(recent_changes / 2)
+                jitter_info = string.format(" | J:~%d°", avg_jitter)
+            end
+            
             local log_msg = string.format(
-                "[Resolver] %s | %.1f→%.1f | Δ%d°%s | %s | M:%d",
+                "[Resolver] %s | %.1f→%.1f | Δ%d°%s | %s%s | M:%d",
                 tostring(player_name),
                 tostring(current_yaw),
                 tostring(resolved_yaw),
                 tostring(desync),
                 mode_info,
                 mode_str,
+                jitter_info,
                 tostring(data.miss_count)
             )
             print(log_msg)
