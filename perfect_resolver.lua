@@ -102,7 +102,15 @@ for i = 1, 65 do
         last_speed = 0,
         
         -- Timing
-        last_update = 0
+        last_update = 0,
+        
+        -- Delay anti-aim tracking
+        last_real_yaw = 0,
+        last_yaw_update_tick = 0,
+        ticks_since_update = 0,
+        delay_detected = false,
+        delay_interval = 0,
+        frozen_ticks = 0
     }
 end
 
@@ -189,6 +197,48 @@ local function resolve_player(player)
     local prev = data.history[#data.history - 1]
     local prev2 = data.history[#data.history - 2]
     
+    -- ===== DELAY ANTI-AIM DETECTION =====
+    
+    local current_tick = global_vars.tick_count()
+    
+    -- Detect if yaw actually updated this tick
+    local yaw_delta_from_last = math.abs(eye_yaw - data.last_real_yaw)
+    local yaw_actually_updated = yaw_delta_from_last > 1.0  -- Threshold for real update
+    
+    if yaw_actually_updated then
+        -- Real update detected
+        local ticks_since_last_update = current_tick - data.last_yaw_update_tick
+        
+        if data.last_yaw_update_tick > 0 and ticks_since_last_update > 0 then
+            -- Update delay interval
+            if data.delay_interval == 0 then
+                data.delay_interval = ticks_since_last_update
+            else
+                -- Smooth the interval (exponential moving average)
+                data.delay_interval = math.floor((data.delay_interval * 0.7) + (ticks_since_last_update * 0.3))
+            end
+            
+            -- Detect delay pattern (updates every N ticks)
+            if ticks_since_last_update >= 2 then
+                data.delay_detected = true
+            end
+        end
+        
+        data.last_real_yaw = eye_yaw
+        data.last_yaw_update_tick = current_tick
+        data.ticks_since_update = 0
+        data.frozen_ticks = 0
+    else
+        -- Yaw is frozen (no update)
+        data.ticks_since_update = data.ticks_since_update + 1
+        data.frozen_ticks = data.frozen_ticks + 1
+        
+        -- If frozen for 2+ ticks, likely delay AA
+        if data.frozen_ticks >= 2 then
+            data.delay_detected = true
+        end
+    end
+    
     -- ===== JITTER DETECTION =====
     
     -- Calculate yaw changes
@@ -241,7 +291,64 @@ local function resolve_player(player)
     local mode = "IDLE"
     local details = {}
     
-    if is_jittering then
+    -- ===== DELAY ANTI-AIM HANDLING =====
+    if data.delay_detected and not is_jittering then
+        mode = "DELAY"
+        
+        -- Predict next update
+        local ticks_until_update = data.delay_interval - data.ticks_since_update
+        local update_imminent = ticks_until_update <= 1
+        
+        if update_imminent and data.delay_interval > 0 then
+            -- About to update - use more aggressive prediction
+            if abs_desync > 35 then
+                -- High desync delay AA
+                if is_standing then
+                    -- Standing delay - likely to flip or hold
+                    correction = desync > 0 and -60 or 60
+                    table.insert(details, "delay_stand")
+                else
+                    -- Moving delay
+                    correction = desync > 0 and -58 or 58
+                    
+                    -- Add velocity consideration
+                    if math.abs(vel_delta) > 100 then
+                        correction = correction + (vel_delta > 0 and 5 or -5)
+                    end
+                    
+                    table.insert(details, "delay_move")
+                end
+                
+                -- Lean is still important
+                if math.abs(lean) > 0.3 then
+                    correction = correction + (lean > 0 and 12 or -12)
+                end
+            else
+                -- Medium/low desync delay
+                correction = desync > 0 and -52 or 52
+            end
+            
+            table.insert(details, string.format("update_in_%dt", ticks_until_update))
+        else
+            -- Frozen state - resolve current position more conservatively
+            if abs_desync > 35 then
+                correction = desync > 0 and -(abs_desync * 0.85) or (abs_desync * 0.85)
+                table.insert(details, "frozen")
+            elseif abs_desync > 20 then
+                correction = desync > 0 and -35 or 35
+            else
+                correction = desync > 0 and -25 or 25
+            end
+            
+            table.insert(details, string.format("frozen_%dt", data.frozen_ticks))
+        end
+        
+        -- Add delay interval info
+        if data.delay_interval > 0 then
+            table.insert(details, string.format("int_%dt", data.delay_interval))
+        end
+        
+    elseif is_jittering then
         mode = "JITTER"
         
         -- ===== STANDING JITTER =====
@@ -490,15 +597,34 @@ local function resolve_player(player)
         
         -- Additional info
         local info_parts = {}
+        
+        -- Delay info (priority)
+        if data.delay_detected then
+            table.insert(info_parts, string.format("DELAY:%dt", data.delay_interval))
+            if data.frozen_ticks > 0 then
+                table.insert(info_parts, string.format("Frozen:%dt", data.frozen_ticks))
+            end
+            if data.ticks_since_update > 0 then
+                table.insert(info_parts, string.format("Since:%dt", data.ticks_since_update))
+            end
+        end
+        
+        -- Jitter info
         if is_jittering then
             table.insert(info_parts, string.format("J:%.0f°", max_yaw_change))
         end
+        
+        -- Side flips
         if data.side_flips > 5 then
             table.insert(info_parts, string.format("SF:%d", data.side_flips))
         end
+        
+        -- Lean
         if math.abs(lean) > 0.2 then
             table.insert(info_parts, string.format("L:%.2f", lean))
         end
+        
+        -- Feet rate
         if math.abs(feet_yaw_rate) > 30 then
             table.insert(info_parts, string.format("FR:%d", math.floor(feet_yaw_rate)))
         end
@@ -553,7 +679,13 @@ callbacks.add(e_callbacks.EVENT, function()
             side_flips = 0,
             was_standing = false,
             last_speed = 0,
-            last_update = 0
+            last_update = 0,
+            last_real_yaw = 0,
+            last_yaw_update_tick = 0,
+            ticks_since_update = 0,
+            delay_detected = false,
+            delay_interval = 0,
+            frozen_ticks = 0
         }
     end
     
@@ -563,8 +695,11 @@ callbacks.add(e_callbacks.EVENT, function()
 end, "round_start")
 
 -- Load message
-print("╔════════════════════════════════════════╗")
-print("║  Perfect Jitter Resolver v6.0         ║")
-print("║  Detailed analysis, maximum accuracy   ║")
-print("║  No ML, No brute - Pure intelligence   ║")
-print("╚════════════════════════════════════════╝")
+print("╔════════════════════════════════════════════╗")
+print("║  Perfect Resolver v6.1 - Ultimate Edition  ║")
+print("║  • Jitter anti-aim resolution              ║")
+print("║  • Delay anti-aim detection (tick-based)   ║")
+print("║  • LBY timing prediction                   ║")
+print("║  • Advanced animstate analysis             ║")
+print("║  No ML, No brute - Pure intelligence       ║")
+print("╚════════════════════════════════════════════╝")
