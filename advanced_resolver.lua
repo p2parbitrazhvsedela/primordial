@@ -92,11 +92,16 @@ for i = 1, MAX_PLAYERS do
         jitter_detected = false,
         consecutive_jitters = 0,
         miss_count = 0,
+        hit_count = 0,
         brute_phase = 0,
         last_update = 0,
         last_side = 0,
         side_changes = 0,
-        predicted_side = 0
+        predicted_side = 0,
+        successful_corrections = {},
+        last_correction = 0,
+        correction_streak = 0,
+        best_correction = 0
     }
 end
 
@@ -212,6 +217,16 @@ local function resolve_player(player)
     local standing = speed_2d < 5
     local lby_about_to_update = standing and time_since_stopped > 0.9 and time_since_stopped < 1.3
     
+    -- Calculate average jitter amplitude
+    local avg_jitter = 0
+    if #data.history >= 3 then
+        local sum = 0
+        for i = #data.history - 2, #data.history - 1 do
+            sum = sum + math.abs(data.history[i+1].eye_yaw - data.history[i].eye_yaw)
+        end
+        avg_jitter = sum / 2
+    end
+    
     -- Jitter detection with multiple indicators
     local is_jittering = (yaw_change > 28 or feet_change > 30) or (side_flip and side_flip2)
     
@@ -219,64 +234,121 @@ local function resolve_player(player)
         data.jitter_detected = true
         data.consecutive_jitters = math.min(data.consecutive_jitters + 1, 20)
         
-        -- Smart brute force after misses
+        -- Adaptive brute force after misses
         if data.miss_count > 2 then
-            -- Cycle through sides with center
-            local brute_angles = {58, -58, 45, -45, 0}
-            data.brute_phase = (data.brute_phase + 1) % #brute_angles
-            correction = brute_angles[data.brute_phase + 1]
+            -- Use successful corrections if available
+            if #data.successful_corrections > 0 and data.miss_count < 5 then
+                -- Try previous successful correction
+                local success_idx = ((data.brute_phase % #data.successful_corrections) + 1)
+                correction = data.successful_corrections[success_idx]
+            else
+                -- Cycle through extended angles based on jitter amplitude
+                local brute_angles
+                if avg_jitter > 70 then
+                    -- Heavy jitter
+                    brute_angles = {60, -60, 58, -58, 52, -52, 0}
+                elseif avg_jitter > 40 then
+                    -- Medium jitter  
+                    brute_angles = {58, -58, 50, -50, 45, -45}
+                else
+                    -- Light jitter
+                    brute_angles = {52, -52, 48, -48, 40, -40}
+                end
+                
+                data.brute_phase = (data.brute_phase + 1) % #brute_angles
+                correction = brute_angles[data.brute_phase + 1]
+            end
             resolved_yaw = eye_yaw + correction
         else
-            -- Intelligent resolution
-            if standing then
-                -- Standing jitter with LBY timing
-                if abs_desync > 35 then
-                    if lby_about_to_update then
-                        -- LBY will update soon - resolve to current side
-                        correction = desync * 0.9
-                    else
-                        -- LBY fresh - resolve opposite with confidence
-                        correction = desync > 0 and -58 or 58
-                        
-                        -- Pattern prediction
-                        if data.side_changes > 8 then
-                            -- Heavy side switching
-                            local predicted = data.consecutive_jitters % 3
-                            if predicted == 0 then correction = 60
-                            elseif predicted == 1 then correction = -60
-                            else correction = 52 * current_side end
-                        end
-                    end
-                else
-                    -- Low desync standing
-                    correction = data.consecutive_jitters % 2 == 0 and 50 or -50
-                end
+            -- Intelligent resolution with learning
+            
+            -- Try to use best correction if we have a streak
+            if data.correction_streak > 2 and data.best_correction ~= 0 then
+                correction = data.best_correction
             else
-                -- Moving jitter with velocity consideration
-                if abs_desync > 35 then
-                    -- High desync moving
-                    local base_corr = desync > 0 and -56 or 56
-                    
-                    -- Consider velocity direction
-                    if math.abs(curr.vel_delta) > 90 then
-                        -- Moving backwards/sideways - more predictable
-                        base_corr = base_corr * 1.08
-                    end
-                    
-                    -- Alternation for heavy jitter
-                    if data.consecutive_jitters > 5 then
-                        if data.consecutive_jitters % 2 == 0 then
-                            base_corr = -base_corr
+                if standing then
+                    -- Standing jitter with LBY timing
+                    if abs_desync > 35 then
+                        if lby_about_to_update then
+                            -- LBY will update soon - resolve to current side
+                            correction = desync * 0.92
+                        else
+                            -- LBY fresh - resolve opposite with confidence
+                            local base = desync > 0 and -58 or 58
+                            
+                            -- Adjust based on jitter amplitude
+                            if avg_jitter > 70 then
+                                base = desync > 0 and -60 or 60
+                            elseif avg_jitter < 40 then
+                                base = desync > 0 and -54 or 54
+                            end
+                            
+                            correction = base
+                            
+                            -- Pattern prediction for heavy switching
+                            if data.side_changes > 10 then
+                                local predicted = data.consecutive_jitters % 4
+                                if predicted == 0 then correction = 60
+                                elseif predicted == 1 then correction = -60
+                                elseif predicted == 2 then correction = 55 * current_side
+                                else correction = -55 * current_side end
+                            elseif data.side_changes > 6 then
+                                -- Medium switching - simple alternation
+                                if data.consecutive_jitters % 2 == 0 then
+                                    correction = -correction
+                                end
+                            end
                         end
+                    elseif abs_desync > 20 then
+                        -- Medium desync standing
+                        correction = data.consecutive_jitters % 2 == 0 and 52 or -52
+                    else
+                        -- Low desync standing
+                        correction = data.consecutive_jitters % 2 == 0 and 48 or -48
                     end
-                    
-                    correction = base_corr
-                elseif abs_desync > 20 then
-                    -- Medium desync
-                    correction = data.consecutive_jitters % 2 == 0 and 52 or -52
                 else
-                    -- Low desync moving
-                    correction = data.consecutive_jitters % 2 == 0 and 48 or -48
+                    -- Moving jitter with velocity consideration
+                    if abs_desync > 35 then
+                        -- High desync moving
+                        local base_corr = desync > 0 and -57 or 57
+                        
+                        -- Adjust for jitter amplitude
+                        if avg_jitter > 70 then
+                            base_corr = desync > 0 and -60 or 60
+                        elseif avg_jitter < 40 then
+                            base_corr = desync > 0 and -52 or 52
+                        end
+                        
+                        -- Consider velocity direction
+                        if math.abs(curr.vel_delta) > 100 then
+                            -- Moving backwards/sideways - more predictable
+                            base_corr = base_corr * 1.10
+                        elseif math.abs(curr.vel_delta) > 80 then
+                            base_corr = base_corr * 1.05
+                        end
+                        
+                        -- Alternation for heavy jitter
+                        if data.consecutive_jitters > 6 then
+                            local alt_phase = data.consecutive_jitters % 3
+                            if alt_phase == 1 then
+                                base_corr = -base_corr
+                            elseif alt_phase == 2 then
+                                base_corr = base_corr * 0.9
+                            end
+                        elseif data.consecutive_jitters > 3 then
+                            if data.consecutive_jitters % 2 == 0 then
+                                base_corr = -base_corr
+                            end
+                        end
+                        
+                        correction = base_corr
+                    elseif abs_desync > 22 then
+                        -- Medium desync moving
+                        correction = data.consecutive_jitters % 2 == 0 and 54 or -54
+                    else
+                        -- Low desync moving
+                        correction = data.consecutive_jitters % 2 == 0 and 50 or -50
+                    end
                 end
             end
             
@@ -331,6 +403,9 @@ local function resolve_player(player)
     
     -- Normalize resolved angle
     resolved_yaw = normalize_angle(resolved_yaw)
+    
+    -- Store correction for learning
+    data.last_correction = math.floor(correction)
     
     -- Apply resolved angle to animstate
     animstate.m_flGoalFeetYaw = resolved_yaw
