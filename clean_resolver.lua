@@ -159,12 +159,21 @@ local function resolve_player(player)
     local prev = data.history[#data.history - 1]
     local prev2 = data.history[#data.history - 2]
     
-    -- Detect jitter by yaw changes
+    -- Advanced jitter detection
     local yaw_change = math.abs(curr.eye_yaw - prev.eye_yaw)
     local yaw_change2 = math.abs(prev.eye_yaw - prev2.eye_yaw)
     local side_flip = (curr.desync_signed * prev.desync_signed) < 0
+    local side_flip2 = #data.history >= 4 and (prev.desync_signed * prev2.desync_signed) < 0 or false
     
-    -- Track side changes
+    -- Calculate jitter metrics
+    local avg_jitter = (yaw_change + yaw_change2) / 2
+    local max_jitter = math.max(yaw_change, yaw_change2)
+    
+    -- Direction analysis
+    local yaw_direction = normalize_angle(curr.eye_yaw - prev.eye_yaw)
+    local desync_delta = math.abs(curr.desync - prev.desync)
+    
+    -- Track side changes for pattern
     local current_side = desync > 0 and 1 or -1
     if current_side ~= data.last_side and data.last_side ~= 0 then
         data.side_changes = data.side_changes + 1
@@ -180,78 +189,125 @@ local function resolve_player(player)
     local moving = speed >= 5 and speed < 150
     local running = speed >= 150
     
-    -- Detect jitter
-    local is_jittering = yaw_change > 30 or (yaw_change > 20 and side_flip)
+    -- Improved jitter detection with multiple signals
+    local is_jittering = (yaw_change > 28) or 
+                        (yaw_change > 22 and side_flip) or 
+                        (side_flip and side_flip2) or
+                        (desync_delta > 30)
     
     if is_jittering then
         mode = "JITTER"
         
-        -- Calculate average jitter amplitude
-        local avg_change = (yaw_change + yaw_change2) / 2
-        
         if standing then
-            -- Standing jitter resolution
+            -- Standing jitter - most common case
             if abs_desync > 35 then
                 -- High desync standing
                 if time_stopped > 1.0 and time_stopped < 1.3 then
-                    -- LBY about to update - resolve current side
+                    -- LBY about to update - resolve TO current side
                     correction = desync * 0.95
                     mode = "JITTER-LBY↑"
                 else
-                    -- Fresh LBY - resolve opposite
-                    if avg_change > 70 then
+                    -- Fresh LBY - resolve OPPOSITE side with amplitude consideration
+                    local base_angle = 58
+                    
+                    -- Adjust base angle by jitter amplitude
+                    if max_jitter > 80 then
+                        -- Very heavy jitter (example: -28° to -108° = 80°)
+                        base_angle = 60
+                    elseif max_jitter > 60 then
                         -- Heavy jitter
-                        correction = desync > 0 and -60 or 60
-                    elseif avg_change > 45 then
+                        base_angle = 58
+                    elseif max_jitter > 40 then
                         -- Medium jitter
-                        correction = desync > 0 and -58 or 58
+                        base_angle = 56
                     else
                         -- Light jitter
-                        correction = desync > 0 and -55 or 55
+                        base_angle = 54
                     end
                     
-                    -- Add lean micro-correction
+                    -- Apply opposite direction
+                    correction = desync > 0 and -base_angle or base_angle
+                    
+                    -- Consider yaw change direction for fine-tuning
+                    if math.abs(yaw_direction) > 50 then
+                        -- Large directional change
+                        local dir_adjust = yaw_direction > 0 and 3 or -3
+                        correction = correction + dir_adjust
+                    end
+                    
+                    -- Lean micro-correction (more aggressive)
                     if math.abs(lean) > 0.3 then
-                        correction = correction + (lean > 0 and 8 or -8)
+                        correction = correction + (lean > 0 and 10 or -10)
+                    elseif math.abs(lean) > 0.15 then
+                        correction = correction + (lean > 0 and 5 or -5)
+                    end
+                    
+                    -- Pattern-based adjustment for heavy side switching
+                    if data.side_changes > 8 then
+                        -- Player is heavily switching - add unpredictability counter
+                        local pattern_adjust = (data.side_changes % 3) - 1
+                        correction = correction + (pattern_adjust * 4)
                     end
                 end
-            elseif abs_desync > 20 then
-                -- Medium desync
-                correction = desync > 0 and -50 or 50
+            elseif abs_desync > 22 then
+                -- Medium desync standing
+                correction = desync > 0 and -52 or 52
+                
+                -- Fine-tune with jitter amplitude
+                if max_jitter > 50 then
+                    correction = correction * 1.08
+                end
             else
-                -- Low desync
-                correction = desync > 0 and -45 or 45
+                -- Low desync standing
+                correction = desync > 0 and -48 or 48
             end
+            
         elseif moving or running then
             -- Moving jitter resolution
             if abs_desync > 35 then
                 -- High desync moving
-                local base = desync > 0 and -58 or 58
+                local base_angle = 58
                 
                 -- Adjust for jitter amplitude
-                if avg_change > 70 then
-                    base = desync > 0 and -60 or 60
-                elseif avg_change < 40 then
-                    base = desync > 0 and -54 or 54
+                if max_jitter > 80 then
+                    base_angle = 60
+                elseif max_jitter > 60 then
+                    base_angle = 58
+                elseif max_jitter > 40 then
+                    base_angle = 56
+                else
+                    base_angle = 54
                 end
                 
-                -- Feet yaw rate prediction
-                if math.abs(feet_rate) > 40 then
-                    base = base + (feet_rate > 0 and 6 or -6)
+                -- Apply opposite
+                correction = desync > 0 and -base_angle or base_angle
+                
+                -- Feet yaw rate prediction (where feet are rotating)
+                if math.abs(feet_rate) > 50 then
+                    correction = correction + (feet_rate > 0 and 8 or -8)
+                elseif math.abs(feet_rate) > 30 then
+                    correction = correction + (feet_rate > 0 and 5 or -5)
                 end
                 
-                correction = base
-            elseif abs_desync > 20 then
-                -- Medium desync
-                correction = desync > 0 and -52 or 52
+                -- Yaw direction consideration
+                if math.abs(yaw_direction) > 60 then
+                    local dir_boost = yaw_direction > 0 and 4 or -4
+                    correction = correction + dir_boost
+                end
+                
+            elseif abs_desync > 22 then
+                -- Medium desync moving
+                correction = desync > 0 and -54 or 54
             else
-                -- Low desync
-                correction = desync > 0 and -48 or 48
+                -- Low desync moving
+                correction = desync > 0 and -50 or 50
             end
             
-            -- Lean adjustment
+            -- Lean adjustment (important for moving)
             if math.abs(lean) > 0.25 then
-                correction = correction + (lean > 0 and 10 or -10)
+                correction = correction + (lean > 0 and 12 or -12)
+            elseif math.abs(lean) > 0.15 then
+                correction = correction + (lean > 0 and 6 or -6)
             end
         end
     else
@@ -289,7 +345,31 @@ local function resolve_player(player)
         if success and name then player_name = name end
         
         local state = standing and "STAND" or (running and "RUN" or "MOVE")
-        local side_info = data.side_changes > 5 and string.format(" SC:%d", data.side_changes) or ""
+        
+        -- Build detailed info string
+        local info_parts = {}
+        
+        -- Jitter amplitude
+        if is_jittering then
+            table.insert(info_parts, string.format("J:%.0f°", max_jitter))
+        end
+        
+        -- Side changes
+        if data.side_changes > 5 then
+            table.insert(info_parts, string.format("SC:%d", data.side_changes))
+        end
+        
+        -- Lean indicator
+        if math.abs(lean) > 0.25 then
+            table.insert(info_parts, string.format("L:%.1f", lean))
+        end
+        
+        -- Feet rate
+        if math.abs(feet_rate) > 30 then
+            table.insert(info_parts, string.format("FR:%d", math.floor(feet_rate)))
+        end
+        
+        local info_str = #info_parts > 0 and (" | " .. table.concat(info_parts, " ")) or ""
         
         print(string.format(
             "[Resolver] %s | %.1f→%.1f | Δ%d° | %s %s | Corr:%d%s",
@@ -300,7 +380,7 @@ local function resolve_player(player)
             mode,
             state,
             math.floor(correction),
-            side_info
+            info_str
         ))
     end
 end
@@ -338,6 +418,11 @@ callbacks.add(e_callbacks.NET_UPDATE, on_net_update)
 callbacks.add(e_callbacks.EVENT, on_round_start, "round_start")
 
 -- Load message
-print("[Resolver] Clean Resolver v4.0 loaded")
+print("[Resolver] Clean Resolver v4.1 loaded")
 print("[Resolver] Pure logic - No ML, No brute force")
-print("[Resolver] Features: LBY timing, jitter detection, lean/feet rate")
+print("[Resolver] Improved jitter correction:")
+print("  • Advanced amplitude analysis (max/avg)")
+print("  • Yaw direction fine-tuning")
+print("  • Multi-tier desync handling")
+print("  • Enhanced lean & feet rate micro-adjustments")
+print("  • Pattern-based side switch detection")
