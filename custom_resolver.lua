@@ -178,12 +178,20 @@ end
 
 local function get_animstate(player)
     local ok, result = pcall(function()
+        if not player then return nil end
+        
         local addr = get_entity_address(player:get_index())
-        if not addr then return nil end
+        if not addr or addr == 0 then return nil end
         
         local player_ptr = ffi.cast("char*", addr)
+        if not player_ptr then return nil end
+        
         local animstate_ptr = player_ptr + 0x9960
         local animstate = ffi.cast("struct CAnimstate**", animstate_ptr)[0]
+        
+        if not animstate or ffi.cast("intptr_t", animstate) == 0 then
+            return nil
+        end
         
         return animstate
     end)
@@ -294,34 +302,34 @@ local resolver_data = {}
 
 local function collect_player_data(player)
     local ok, result = pcall(function()
-        local velocity = player:get_prop("m_vecVelocity")
-        local origin = player:get_prop("m_vecOrigin")
-        local duck = player:get_prop("m_flDuckAmount")
-        local sim_time = player:get_prop("m_flSimulationTime")
-        local flags = player:get_prop("m_fFlags")
+        if not player then return nil end
+        
+        -- Get animstate first (most important)
+        local animstate = get_animstate(player)
+        if not animstate then return nil end
+        
+        -- Get props safely
+        local velocity = player:get_prop("m_vecVelocity") or {x = 0, y = 0, z = 0}
+        local origin = player:get_prop("m_vecOrigin") or {x = 0, y = 0, z = 0}
+        local duck = player:get_prop("m_flDuckAmount") or 0
+        local flags = player:get_prop("m_fFlags") or 0
         
         local data = {
-            animstate = get_animstate(player),
-            layers = analyze_animation_layers(player),
-            velocity = velocity or {x = 0, y = 0, z = 0},
+            animstate = animstate,
+            layers = {},  -- Simplified - not needed for core resolver
+            velocity = velocity,
             eye_angles = {yaw = 0, pitch = 0},
-            simulation_time = sim_time or 0,
-            flags = flags or 0,
-            duck_amount = duck or 0,
-            origin = origin or {x = 0, y = 0, z = 0}
+            flags = flags,
+            duck_amount = duck,
+            origin = origin
         }
         
-        -- Get eye yaw from animstate
-        if data.animstate then
-            data.eye_angles.yaw = data.animstate.m_flEyeYaw
-            data.eye_angles.pitch = data.animstate.m_flPitch
-        end
+        -- Get eye yaw from animstate (reliable source)
+        data.eye_angles.yaw = animstate.m_flEyeYaw
+        data.eye_angles.pitch = animstate.m_flPitch
         
         -- Calculate 2D velocity
-        data.velocity_2d = math.sqrt(data.velocity.x^2 + data.velocity.y^2)
-        
-        -- Detect animation state
-        data.anim_state = detect_animation_state(data.layers)
+        data.velocity_2d = math.sqrt(velocity.x^2 + velocity.y^2)
         
         return data
     end)
@@ -330,161 +338,108 @@ local function collect_player_data(player)
 end
 
 local function calculate_desync_direction(data)
-    if not data.animstate then return 0, 0 end
+    if not data or not data.animstate then return 0 end
     
     local animstate = data.animstate
     
-    -- Get critical values from animstate
-    local eye_yaw = animstate.m_flEyeYaw
-    local goal_feet_yaw = animstate.m_flGoalFeetYaw
-    local current_feet_yaw = animstate.m_flCurrentFeetYaw
-    local current_torso_yaw = animstate.m_flCurrentTorsoYaw
-    local body_lean = animstate.m_flLeanAmount
-    
-    -- ===== MATHEMATICAL DETERMINATION FROM TЗ =====
-    -- "Анализ через feet cycle и torso yaw"
-    -- "Математическое определение стороны"
-    
-    -- Calculate feet delta (GoalFeetYaw - CurrentFeetYaw)
-    local feet_delta = calculate_delta(goal_feet_yaw, current_feet_yaw)
-    
-    -- Calculate eye to feet desync
-    local eye_feet_desync = calculate_delta(eye_yaw, goal_feet_yaw)
-    
-    local confidence = 0
-    local direction = 0
-    
-    -- Primary: feet_delta analysis (from TЗ)
-    if math.abs(feet_delta) > 35 then
-        -- Large feet delta = high confidence
-        direction = feet_delta > 0 and 1 or -1
-        confidence = 0.90
-        return direction, confidence
-    end
-    
-    -- Secondary: body lean (from TЗ - "body_lean > 0 and 1 or -1")
-    if math.abs(body_lean) > 0.5 then
-        direction = body_lean > 0 and 1 or -1
-        confidence = 0.85
-        return direction, confidence
-    end
-    
-    -- Tertiary: torso yaw analysis
-    local torso_delta = calculate_delta(current_torso_yaw, eye_yaw)
-    if math.abs(torso_delta) > 20 then
-        direction = torso_delta > 0 and 1 or -1
-        confidence = 0.75
-        return direction, confidence
-    end
-    
-    -- Fallback: eye_yaw direction (from TЗ example)
-    if math.abs(eye_feet_desync) > 35 then
-        -- Maximum desync detected
-        direction = eye_feet_desync > 0 and 1 or -1
-        confidence = 0.85
-        return direction, confidence
-    end
-    
-    -- Layer-based fallback
-    local layer_6 = data.layers[ANIMATION_LAYER.MOVEMENT_MOVE]
-    if layer_6 and layer_6.weight > 0.9 then
-        -- Moving with high weight
-        if math.abs(body_lean) > 0 then
-            direction = body_lean > 0 and 1 or -1
-            confidence = 0.70
-            return direction, confidence
+    -- Safe access to animstate values
+    local ok, direction = pcall(function()
+        local goal_feet_yaw = animstate.m_flGoalFeetYaw
+        local current_feet_yaw = animstate.m_flCurrentFeetYaw
+        local body_lean = animstate.m_flLeanAmount
+        local feet_cycle = animstate.m_flFeetCycle
+        
+        -- ===== MATHEMATICAL DETERMINATION FROM TЗ =====
+        -- "Анализ через feet cycle и torso yaw"
+        
+        -- Calculate feet delta (from TЗ)
+        local feet_delta = calculate_delta(goal_feet_yaw, current_feet_yaw)
+        
+        -- Primary: feet_delta > 35 (from TЗ)
+        if math.abs(feet_delta) > 35 then
+            return feet_delta > 0 and 1 or -1
         end
-    end
+        
+        -- Secondary: body lean (from TЗ - "body_lean > 0 and 1 or -1")
+        if math.abs(body_lean) > 0.1 then
+            return body_lean > 0 and 1 or -1
+        end
+        
+        -- Fallback: use feet cycle
+        if feet_cycle > 0.5 then
+            return 1
+        else
+            return -1
+        end
+    end)
     
-    -- Last resort: feet cycle analysis
-    local feet_cycle = animstate.m_flFeetCycle
-    if feet_cycle > 0.5 then
-        direction = 1
-        confidence = 0.60
-    else
-        direction = -1
-        confidence = 0.60
-    end
-    
-    return direction, confidence
+    return ok and direction or 0
 end
 
-local function calculate_resolved_angle(player, data, direction_modifier, confidence)
-    if not data.animstate then
+local function calculate_resolved_angle(player, data, direction_modifier)
+    if not data or not data.animstate or direction_modifier == 0 then
+        return data and data.eye_angles.yaw or 0, 0
+    end
+    
+    local ok, resolved_yaw, correction = pcall(function()
+        local animstate = data.animstate
+        
+        -- Get animstate values
+        local eye_yaw = animstate.m_flEyeYaw
+        local goal_feet_yaw = animstate.m_flGoalFeetYaw
+        local feet_yaw_rate = animstate.m_flFeetYawRate
+        local body_lean = animstate.m_flLeanAmount
+        local anim_delta = animstate.m_flAnimUpdateDelta
+        
+        -- Time delta for formula
+        local time_delta = anim_delta
+        if time_delta <= 0 or time_delta > 1.0 then
+            time_delta = global_vars.interval_per_tick()
+        end
+        
+        -- ===== TЗ FORMULA =====
+        -- real_yaw = eye_yaw + (feet_yaw_rate * time_delta * direction_modifier)
+        
+        local result_yaw = eye_yaw + (feet_yaw_rate * time_delta * direction_modifier)
+        
+        -- ===== DESYNC CORRECTION =====
+        local desync = calculate_delta(eye_yaw, goal_feet_yaw)
+        local abs_desync = math.abs(desync)
+        
+        -- High desync = jitter, resolve to goal_feet_yaw (real position)
+        if abs_desync > 35 then
+            result_yaw = goal_feet_yaw + (body_lean * 45)
+        elseif abs_desync > 20 then
+            result_yaw = goal_feet_yaw + (body_lean * 40)
+        elseif abs_desync > 10 then
+            result_yaw = result_yaw + (body_lean * 30)
+        end
+        
+        -- Movement adjustment
+        if data.velocity_2d > 100 then
+            local vel_x = animstate.m_vVelocityX
+            local vel_y = animstate.m_vVelocityY
+            
+            if math.abs(vel_x) > 10 or math.abs(vel_y) > 10 then
+                local move_yaw = math.deg(math.atan2(vel_y, vel_x))
+                local move_delta = calculate_delta(move_yaw, eye_yaw)
+                result_yaw = result_yaw + (move_delta * 0.12)
+            end
+        end
+        
+        -- Normalize
+        result_yaw = normalize_angle(result_yaw)
+        
+        local corr = calculate_delta(result_yaw, eye_yaw)
+        
+        return result_yaw, math.abs(corr)
+    end)
+    
+    if ok then
+        return resolved_yaw, correction
+    else
         return data.eye_angles.yaw, 0
     end
-    
-    local animstate = data.animstate
-    
-    -- Get animstate values
-    local eye_yaw = animstate.m_flEyeYaw
-    local goal_feet_yaw = animstate.m_flGoalFeetYaw
-    local feet_yaw_rate = animstate.m_flFeetYawRate
-    local body_lean = animstate.m_flLeanAmount
-    local anim_delta = animstate.m_flAnimUpdateDelta
-    
-    -- Time delta for formula
-    local time_delta = anim_delta
-    if time_delta <= 0 or time_delta > 1.0 then
-        time_delta = global_vars.interval_per_tick()
-    end
-    
-    -- ===== PRIMARY: TЗ FORMULA =====
-    -- real_yaw = eye_yaw + (feet_yaw_rate * time_delta * direction_modifier)
-    
-    local resolved_yaw = eye_yaw
-    
-    if direction_modifier ~= 0 then
-        resolved_yaw = eye_yaw + (feet_yaw_rate * time_delta * direction_modifier)
-    end
-    
-    -- ===== DESYNC-BASED CORRECTION (jitter handling) =====
-    local desync = calculate_delta(eye_yaw, goal_feet_yaw)
-    local abs_desync = math.abs(desync)
-    
-    -- For high desync (jitter AA), apply direct opposite correction
-    if abs_desync > 35 then
-        -- Jitter detected - resolve to OPPOSITE side
-        -- This is the real body position
-        resolved_yaw = goal_feet_yaw
-        
-        -- Fine-tune with lean (shows exact body angle)
-        resolved_yaw = resolved_yaw + (body_lean * 45)
-        
-    elseif abs_desync > 20 then
-        -- Medium desync - blend formula + opposite
-        local opposite_yaw = goal_feet_yaw + (body_lean * 40)
-        
-        -- Blend with confidence
-        resolved_yaw = resolved_yaw * (1 - confidence) + opposite_yaw * confidence
-        
-    elseif abs_desync > 10 then
-        -- Low desync - use lean to adjust
-        resolved_yaw = resolved_yaw + (body_lean * 30)
-    end
-    
-    -- Movement adjustment (for moving targets)
-    if data.velocity_2d > 100 then
-        local vel_x = animstate.m_vVelocityX
-        local vel_y = animstate.m_vVelocityY
-        
-        if math.abs(vel_x) > 10 or math.abs(vel_y) > 10 then
-            -- Calculate movement direction
-            local move_yaw = math.deg(math.atan2(vel_y, vel_x))
-            local move_delta = calculate_delta(move_yaw, eye_yaw)
-            
-            -- Adjust toward movement direction
-            resolved_yaw = resolved_yaw + (move_delta * 0.12)
-        end
-    end
-    
-    -- Normalize result
-    resolved_yaw = normalize_angle(resolved_yaw)
-    
-    -- Calculate total correction applied
-    local correction = calculate_delta(resolved_yaw, eye_yaw)
-    
-    return resolved_yaw, math.abs(correction)
 end
 
 local function validate_resolution(player, resolved_angle, data)
@@ -520,35 +475,39 @@ local function resolve_player(player)
             return
         end
         
-        -- Calculate desync direction and confidence
-        local direction, confidence = calculate_desync_direction(data)
+        -- Calculate desync direction
+        local direction = calculate_desync_direction(data)
+        
+        if direction == 0 then
+            return
+        end
         
         -- Calculate resolved angle
-        local resolved_yaw, desync_amount = calculate_resolved_angle(player, data, direction, confidence)
+        local resolved_yaw, desync_amount = calculate_resolved_angle(player, data, direction)
         
         -- Validate resolution
         if not validate_resolution(player, resolved_yaw, data) then
-            resolved_yaw = data.eye_angles.yaw
-            confidence = 0
+            return
         end
         
-        -- Store resolver data
-        resolver_data[player_idx] = {
-            original_yaw = data.eye_angles.yaw,
-            resolved_yaw = resolved_yaw,
-            confidence = confidence,
-            desync_amount = desync_amount,
-            direction = direction,
-            tick = current_tick
-        }
+        -- Store resolver data (only if valid)
+        if resolved_yaw and desync_amount then
+            resolver_data[player_idx] = {
+                original_yaw = data.eye_angles.yaw,
+                resolved_yaw = resolved_yaw,
+                desync_amount = desync_amount,
+                direction = direction,
+                tick = current_tick
+            }
+        end
         
-        -- Apply resolution via animstate
-        if data.animstate then
+        -- Apply resolution via animstate (safe)
+        if data.animstate and data.animstate.m_flGoalFeetYaw then
             data.animstate.m_flGoalFeetYaw = resolved_yaw
         end
         
         -- Log if enabled
-        log_resolution(player:get_name(), data.eye_angles.yaw, resolved_yaw, confidence)
+        log_resolution(player:get_name(), data.eye_angles.yaw, resolved_yaw, desync_amount)
     end)
     
     if not ok then
@@ -577,13 +536,21 @@ local function on_create_move(cmd)
         return
     end
     
-    -- Resolve all enemy players
+    -- Resolve enemy players (with safety limit)
     local enemies = entity_list.get_players(true)
-    if enemies then
-        for _, player in pairs(enemies) do
-            if player and player:is_alive() then
-                resolve_player(player)
-            end
+    if not enemies then return end
+    
+    local resolved_count = 0
+    local max_resolve_per_tick = 5  -- Limit to prevent crashes
+    
+    for _, player in pairs(enemies) do
+        if resolved_count >= max_resolve_per_tick then
+            break
+        end
+        
+        if player and player:is_alive() and not player:is_dormant() then
+            resolve_player(player)
+            resolved_count = resolved_count + 1
         end
     end
 end
@@ -593,27 +560,30 @@ local function on_paint()
         return
     end
     
-    -- Clean up old data
-    local current_tick = global_vars.tick_count()
-    for idx, data in pairs(resolver_data) do
-        if current_tick - data.tick > 64 then
-            resolver_data[idx] = nil
+    -- Clean up old data safely
+    local ok = pcall(function()
+        local current_tick = global_vars.tick_count()
+        for idx, data in pairs(resolver_data) do
+            if data and data.tick and (current_tick - data.tick > 64) then
+                resolver_data[idx] = nil
+            end
         end
-    end
+    end)
 end
 
 -- =====================================
 -- 8. LOGGING SYSTEM
 -- =====================================
-function log_resolution(player_name, original_yaw, resolved_yaw, confidence)
+function log_resolution(player_name, original_yaw, resolved_yaw, desync_amount)
     if not menu_items.logs:get() then return end
     
     local delta = calculate_delta(resolved_yaw, original_yaw)
     
-    print(string.format("[Resolver] %s | Delta: %.1f° | Confidence: %.1f%%",
+    print(string.format("[Resolver] %s | %.1f° → %.1f° | Correction: %.1f°",
         player_name,
-        delta,
-        confidence * 100
+        original_yaw,
+        resolved_yaw,
+        delta
     ))
 end
 
