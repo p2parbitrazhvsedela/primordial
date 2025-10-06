@@ -450,9 +450,9 @@ local function resolve_player(player)
             return
         end
         
-        -- Check if player is a bot
-        local is_bot = player:get_prop("m_bIsBot")
-        if is_bot then
+        -- Check if player is a bot (FakeClient)
+        local is_fake_client = player:get_prop("m_bIsPlayerFakeClient")
+        if is_fake_client and is_fake_client == 1 then
             return
         end
         
