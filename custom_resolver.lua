@@ -299,6 +299,7 @@ end
 -- =====================================
 local player_cache = {}
 local resolver_data = {}
+local last_resolve_tick = {}  -- Track when we last resolved each player
 
 local function collect_player_data(player)
     local ok, result = pcall(function()
@@ -469,6 +470,17 @@ local function resolve_player(player)
         local player_idx = player:get_index()
         local current_tick = global_vars.tick_count()
         
+        -- ===== RATE LIMITING - Don't resolve every tick =====
+        local last_tick = last_resolve_tick[player_idx] or 0
+        local ticks_since_last = current_tick - last_tick
+        
+        -- Only resolve every 8 ticks (prevents freezing)
+        if ticks_since_last < 8 then
+            return
+        end
+        
+        last_resolve_tick[player_idx] = current_tick
+        
         -- Collect fresh data
         local data = collect_player_data(player)
         if not data or not data.animstate then
@@ -499,15 +511,16 @@ local function resolve_player(player)
                 direction = direction,
                 tick = current_tick
             }
+            
+            -- Apply resolution ONLY via animstate
+            -- Writing to memory - do it ONCE per resolve
+            if data.animstate then
+                data.animstate.m_flGoalFeetYaw = resolved_yaw
+            end
+            
+            -- Log if enabled (only once per resolve)
+            log_resolution(player:get_name(), data.eye_angles.yaw, resolved_yaw, desync_amount)
         end
-        
-        -- Apply resolution via animstate (safe)
-        if data.animstate and data.animstate.m_flGoalFeetYaw then
-            data.animstate.m_flGoalFeetYaw = resolved_yaw
-        end
-        
-        -- Log if enabled
-        log_resolution(player:get_name(), data.eye_angles.yaw, resolved_yaw, desync_amount)
     end)
     
     if not ok then
@@ -531,28 +544,30 @@ local function on_create_move(cmd)
         return
     end
     
-    local local_player = entity_list.get_local_player()
-    if not local_player or not local_player:is_alive() then
-        return
-    end
-    
-    -- Resolve enemy players (with safety limit)
-    local enemies = entity_list.get_players(true)
-    if not enemies then return end
-    
-    local resolved_count = 0
-    local max_resolve_per_tick = 5  -- Limit to prevent crashes
-    
-    for _, player in pairs(enemies) do
-        if resolved_count >= max_resolve_per_tick then
-            break
+    local ok = pcall(function()
+        local local_player = entity_list.get_local_player()
+        if not local_player or not local_player:is_alive() then
+            return
         end
         
-        if player and player:is_alive() and not player:is_dormant() then
-            resolve_player(player)
-            resolved_count = resolved_count + 1
+        -- Resolve enemy players (with safety limit)
+        local enemies = entity_list.get_players(true)
+        if not enemies then return end
+        
+        local resolved_count = 0
+        local max_resolve_per_tick = 3  -- Reduced from 5 to prevent freezing
+        
+        for _, player in pairs(enemies) do
+            if resolved_count >= max_resolve_per_tick then
+                break
+            end
+            
+            if player and player:is_alive() and not player:is_dormant() then
+                resolve_player(player)
+                resolved_count = resolved_count + 1
+            end
         end
-    end
+    end)
 end
 
 local function on_paint()
