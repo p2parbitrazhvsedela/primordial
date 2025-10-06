@@ -450,6 +450,12 @@ local function resolve_player(player)
             return
         end
         
+        -- Check if player is a bot
+        local is_bot = player:get_prop("m_bIsBot")
+        if is_bot then
+            return
+        end
+        
         local player_idx = player:get_index()
         local current_tick = global_vars.tick_count()
         
