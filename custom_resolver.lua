@@ -330,121 +330,118 @@ local function collect_player_data(player)
 end
 
 local function calculate_desync_direction(data)
-    if not data.animstate then return 0, 0 end
+    if not data.animstate then return 0, 0, 0 end
     
     local animstate = data.animstate
+    
+    -- Get critical values
+    local eye_yaw = animstate.m_flEyeYaw
+    local goal_feet_yaw = animstate.m_flGoalFeetYaw
+    local current_feet_yaw = animstate.m_flCurrentFeetYaw
+    local body_lean = animstate.m_flLeanAmount
+    local feet_yaw_rate = animstate.m_flFeetYawRate
+    
+    -- Calculate desync (eye to feet)
+    local desync = calculate_delta(eye_yaw, goal_feet_yaw)
+    local abs_desync = math.abs(desync)
+    
+    -- No desync - no resolve needed
+    if abs_desync < 5 then
+        return 0, 0, 0
+    end
+    
+    -- Determine direction based on feet delta analysis
+    local feet_delta = calculate_delta(goal_feet_yaw, current_feet_yaw)
     local confidence = 0
     
-    -- Calculate eye to feet desync
-    local eye_feet_delta = calculate_delta(animstate.m_flEyeYaw, animstate.m_flGoalFeetYaw)
-    local abs_delta = math.abs(eye_feet_delta)
+    -- Primary direction from desync
+    -- Jitter shows fake on one side, real is OPPOSITE
+    local direction_modifier = -1  -- Always opposite
     
-    -- Desync direction is OPPOSITE to eye yaw side (jitter principle)
-    local desync_side = eye_feet_delta > 0 and 1 or -1
-    
-    -- Body lean is THE MOST important indicator
-    local body_lean = animstate.m_flLeanAmount
-    
-    -- High desync with lean
-    if abs_delta > 35 then
+    -- Confidence based on desync magnitude
+    if abs_desync > 40 then
         confidence = 0.95
-        
-        -- Lean confirms or corrects direction
-        if math.abs(body_lean) > 0.3 then
-            local lean_side = body_lean > 0 and 1 or -1
-            -- If lean agrees with desync, high confidence
-            if lean_side == desync_side then
-                confidence = 0.98
-            end
-            return desync_side, confidence
-        end
-        
-        return desync_side, confidence
+    elseif abs_desync > 30 then
+        confidence = 0.85
+    elseif abs_desync > 20 then
+        confidence = 0.75
+    else
+        confidence = 0.65
     end
     
-    -- Medium desync
-    if abs_delta > 20 then
-        confidence = 0.80
-        
-        -- Lean is critical
-        if math.abs(body_lean) > 0.2 then
-            return body_lean > 0 and 1 or -1, 0.85
-        end
-        
-        return desync_side, confidence
+    -- Boost confidence if lean confirms
+    if math.abs(body_lean) > 0.2 then
+        confidence = math.min(confidence + 0.05, 0.99)
     end
     
-    -- Low desync or standing
-    if abs_delta > 10 then
-        confidence = 0.70
-        
-        -- Use lean as primary
-        if math.abs(body_lean) > 0.15 then
-            return body_lean > 0 and 1 or -1, 0.75
-        end
-        
-        return desync_side, confidence
-    end
-    
-    -- Very low/no desync - use feet yaw rate
-    local feet_yaw_rate = animstate.m_flFeetYawRate
-    if math.abs(feet_yaw_rate) > 10 then
-        confidence = 0.60
-        return feet_yaw_rate > 0 and 1 or -1, confidence
-    end
-    
-    return 0, 0
+    return direction_modifier, confidence, abs_desync
 end
 
-local function calculate_resolved_angle(player, data, direction, confidence)
-    if not data.animstate then
+local function calculate_resolved_angle(player, data, direction_modifier, confidence, abs_desync)
+    if not data.animstate or direction_modifier == 0 then
         return data.eye_angles.yaw, 0
     end
     
     local animstate = data.animstate
-    local base_yaw = animstate.m_flEyeYaw
-    local goal_feet_yaw = animstate.m_flGoalFeetYaw
     
-    if direction == 0 then
-        return base_yaw, 0
+    -- Get base values
+    local eye_yaw = animstate.m_flEyeYaw
+    local goal_feet_yaw = animstate.m_flGoalFeetYaw
+    local feet_yaw_rate = animstate.m_flFeetYawRate
+    local body_lean = animstate.m_flLeanAmount
+    local anim_delta = animstate.m_flAnimUpdateDelta
+    
+    -- ===== FORMULA FROM TЗ =====
+    -- real_yaw = eye_yaw + (feet_yaw_rate * time_delta * direction_modifier)
+    
+    local time_delta = anim_delta
+    if time_delta == 0 or time_delta > 1.0 then
+        time_delta = global_vars.interval_per_tick()
     end
     
-    -- Calculate actual desync amount from animstate
-    local eye_feet_desync = calculate_delta(base_yaw, goal_feet_yaw)
-    local abs_desync = math.abs(eye_feet_desync)
+    -- Base calculation using feet_yaw_rate (from TЗ formula)
+    local feet_contribution = feet_yaw_rate * time_delta * direction_modifier
     
-    -- Base correction: resolve to OPPOSITE side
-    local base_correction = abs_desync
+    -- Calculate desync
+    local desync = calculate_delta(eye_yaw, goal_feet_yaw)
     
-    -- Direction: opposite to current desync
-    local correction = eye_feet_desync > 0 and -base_correction or base_correction
+    -- Resolve to opposite side of desync (jitter principle)
+    local base_correction = 0
     
-    -- LEAN adjustment (most important)
-    local lean = animstate.m_flLeanAmount
-    correction = correction + (lean * 35)
+    if math.abs(desync) > 5 then
+        -- Use actual desync magnitude as base
+        base_correction = desync > 0 and -abs_desync or abs_desync
+    else
+        base_correction = 0
+    end
     
-    -- FEET YAW RATE (shows rotation direction and speed)
-    local feet_yaw_rate = animstate.m_flFeetYawRate
-    correction = correction + (feet_yaw_rate * 0.15)
+    -- Combine: base correction + feet rate contribution
+    local correction = base_correction + feet_contribution
     
-    -- Movement adjustment
+    -- LEAN adjustment (critical for accuracy)
+    -- Lean shows real body position
+    correction = correction + (body_lean * 40)
+    
+    -- Movement direction (for moving players)
     if data.velocity_2d > 80 then
-        -- Player is moving - body follows movement more
-        local move_x = animstate.m_vVelocityX
-        local move_y = animstate.m_vVelocityY
+        local vel_x = animstate.m_vVelocityX
+        local vel_y = animstate.m_vVelocityY
         
-        if math.abs(move_x) > 1 or math.abs(move_y) > 1 then
-            local move_angle = math.deg(math.atan2(move_y, move_x))
-            local move_delta = calculate_delta(move_angle, base_yaw)
-            correction = correction + (move_delta * 0.10)
+        if math.abs(vel_x) > 5 or math.abs(vel_y) > 5 then
+            -- Calculate movement angle
+            local movement_angle = math.deg(math.atan2(vel_y, vel_x))
+            local movement_delta = calculate_delta(movement_angle, eye_yaw)
+            
+            -- Body tends to align with movement
+            correction = correction + (movement_delta * 0.12)
         end
     end
     
-    -- Clamp correction
-    correction = clamp(correction, -65, 65)
+    -- Clamp to realistic limits
+    correction = clamp(correction, -60, 60)
     
-    -- Apply correction to base yaw
-    local resolved_yaw = normalize_angle(base_yaw + correction)
+    -- Final resolved yaw
+    local resolved_yaw = normalize_angle(eye_yaw + correction)
     
     return resolved_yaw, math.abs(correction)
 end
@@ -495,10 +492,10 @@ local function resolve_player(player)
         end
         
         -- Calculate desync direction and confidence
-        local direction, confidence = calculate_desync_direction(data)
+        local direction, confidence, abs_desync = calculate_desync_direction(data)
         
         -- Calculate resolved angle
-        local resolved_yaw, desync_amount = calculate_resolved_angle(player, data, direction, confidence)
+        local resolved_yaw, desync_amount = calculate_resolved_angle(player, data, direction, confidence, abs_desync)
         
         -- Validate resolution
         if not validate_resolution(player, resolved_yaw, data) then
