@@ -511,18 +511,6 @@ local function resolve_player(player)
             return
         end
         
-        -- Check if player is a bot (multiple methods)
-        local player_info = engine.get_player_info(player:get_index())
-        if player_info and player_info.fakeplayer then
-            return
-        end
-        
-        -- Fallback check via prop
-        local is_fake = player:get_prop("m_bIsPlayerFakeClient")
-        if is_fake == true or is_fake == 1 then
-            return
-        end
-        
         local player_idx = player:get_index()
         local current_tick = global_vars.tick_count()
         
